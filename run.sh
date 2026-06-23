@@ -344,14 +344,12 @@ log "${#TOR_PORTS[@]}/$TOR_INSTANCES Tor instances up on ports ${TOR_PORTS[*]}"
 TOR_SPEC=$(IFS=,; echo "${TOR_PORTS[*]/#/127.0.0.1:}")
 
 # --------------------------------------------------------------------------
-# 6. Ensure download.py is present (refresh from GitHub if stale)
+# 6. Ensure download.py is present (always refresh from GitHub)
 # --------------------------------------------------------------------------
 mkdir -p "$THREEAM_DIR"
-if [[ ! -f "$THREEAM_DIR/download.py" ]]; then
-  log "Fetching download.py from GitHub..."
-  curl -fsSL "$REPO_RAW/download.py" -o "$THREEAM_DIR/download.py"
-  chmod +x "$THREEAM_DIR/download.py"
-fi
+log "Fetching latest download.py from GitHub..."
+curl -fsSL "$REPO_RAW/download.py" -o "$THREEAM_DIR/download.py"
+chmod +x "$THREEAM_DIR/download.py"
 
 # --------------------------------------------------------------------------
 # 7. Download
