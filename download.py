@@ -49,6 +49,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
@@ -66,6 +67,26 @@ USER_AGENT = "Mozilla/5.0 (threeam-downloader/1.0)"
 CHUNK_SIZE = 64 * 1024
 SPEED_WINDOW_SEC = 60.0
 STATUS_INTERVAL_SEC = 1.0
+MILESTONE_INTERVAL_SEC = 30.0
+BAR_WIDTH = 28
+
+# ---------------------------------------------------------------------------
+# Terminal colours (auto-disabled when not a TTY)
+# ---------------------------------------------------------------------------
+
+_IS_TTY = sys.stdout.isatty()
+
+
+def _ansi(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if _IS_TTY else text
+
+
+def green(text: str)  -> str: return _ansi("32", text)
+def red(text: str)    -> str: return _ansi("31", text)
+def yellow(text: str) -> str: return _ansi("33", text)
+def grey(text: str)   -> str: return _ansi("90", text)
+def cyan(text: str)   -> str: return _ansi("36", text)
+def bold(text: str)   -> str: return _ansi("1", text)
 
 # ---------------------------------------------------------------------------
 # Parsing
@@ -145,6 +166,23 @@ def fmt_duration(seconds: float) -> str:
     return f"{s}s"
 
 
+def fmt_clock(seconds_from_now: float) -> str:
+    """Format ETA as a wall-clock string in local time, e.g. 'Sat 27 Jun 03:14'."""
+    if seconds_from_now == float("inf") or seconds_from_now < 0:
+        return "       --        "
+    return (datetime.now() + timedelta(seconds=seconds_from_now)).strftime("%a %d %b %H:%M")
+
+
+def render_bar(pct: float, width: int = BAR_WIDTH) -> str:
+    pct = max(0.0, min(100.0, pct))
+    filled = int(width * pct / 100)
+    return "█" * filled + "░" * (width - filled)
+
+
+def fmt_gib(n: float) -> str:
+    return f"{n / (1024 ** 3):6.2f} GiB"
+
+
 # ---------------------------------------------------------------------------
 # Shared download stats
 # ---------------------------------------------------------------------------
@@ -211,20 +249,47 @@ class Stats:
         return remaining / speed
 
     def render_status_line(self) -> str:
+        """Short status line for live TTY updates."""
         elapsed = time.monotonic() - self.start
         pct = 100.0 * self.downloaded / self.total_bytes if self.total_bytes else 0.0
-        line = (
-            f"[{self.completed_files:>6}/{self.total_files} files]  "
-            f"{self.downloaded / (1024 ** 3):6.2f} GiB / "
-            f"{self.total_bytes / (1024 ** 3):6.2f} GiB "
-            f"({pct:4.1f}%) | "
-            f"{fmt_speed(self.rolling_speed)} | "
-            f"ETA {fmt_duration(self.eta_seconds):>7} | "
-            f"active {self.active_files} | "
-            f"err {self.error_files} | "
-            f"elapsed {fmt_duration(elapsed)}"
+        speed = self.rolling_speed or self.lifetime_speed
+        return (
+            f"[{render_bar(pct)}] {pct:5.2f}%  "
+            f"{fmt_gib(self.downloaded)} / {fmt_gib(self.total_bytes)}  "
+            f"| {fmt_speed(speed)}  "
+            f"| ETA {fmt_duration(self.eta_seconds)}  "
+            f"| finish {fmt_clock(self.eta_seconds)}  "
+            f"| {self.completed_files:,}/{self.total_files:,} files  "
+            f"| active {self.active_files}  "
+            f"| err {self.error_files}  "
+            f"| {fmt_duration(elapsed)}"
         )
-        return line
+
+    def render_milestone(self) -> str:
+        """Multi-line checkpoint written to stdout (captured in tee'd logs)."""
+        elapsed = time.monotonic() - self.start
+        pct = 100.0 * self.downloaded / self.total_bytes if self.total_bytes else 0.0
+        speed = self.lifetime_speed
+        rolling = self.rolling_speed
+        eta = self.eta_seconds
+        remaining = max(0, self.total_bytes - self.downloaded)
+        with self.lock:
+            active = self.active_files
+            done = self.completed_files
+            errors = self.error_files
+        clock_now = datetime.now().strftime("%H:%M:%S")
+        return (
+            f"[{clock_now}] {bold('checkpoint')} "
+            f"[{render_bar(pct)}] {pct:5.2f}%\n"
+            f"        downloaded : {fmt_gib(self.downloaded)} of {fmt_gib(self.total_bytes)} "
+            f"({fmt_gib(remaining)} left)\n"
+            f"        files      : {done:,} done / {self.total_files:,} total "
+            f"(active {active}, errors {errors})\n"
+            f"        speed      : {fmt_speed(rolling)} rolling  |  "
+            f"{fmt_speed(speed)} avg since start\n"
+            f"        time       : elapsed {fmt_duration(elapsed)}  |  "
+            f"ETA {fmt_duration(eta)}  |  finish {fmt_clock(eta)}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -304,25 +369,42 @@ def download_one(
 # ---------------------------------------------------------------------------
 
 class Reporter(threading.Thread):
-    """Periodically rewrites a single status line on stderr."""
+    """Two outputs:
 
-    def __init__(self, stats: Stats, interval: float = STATUS_INTERVAL_SEC):
+    * Every STATUS_INTERVAL_SEC: rewrite a one-line status on stderr (if TTY).
+    * Every MILESTONE_INTERVAL_SEC: append a multi-line checkpoint to stdout
+      so it shows up in `tee`'d log files even when stderr isn't a terminal.
+    """
+
+    def __init__(
+        self,
+        stats: Stats,
+        interval: float = STATUS_INTERVAL_SEC,
+        milestone_interval: float = MILESTONE_INTERVAL_SEC,
+    ):
         super().__init__(daemon=True, name="status-reporter")
         self.stats = stats
         self.interval = interval
+        self.milestone_interval = milestone_interval
         self._stop = threading.Event()
-        self._enabled = sys.stderr.isatty()
+        self._stderr_tty = sys.stderr.isatty()
+        self._last_milestone = 0.0
 
     def stop(self) -> None:
         self._stop.set()
 
     def run(self) -> None:
-        if not self._enabled:
-            return
+        next_milestone = self.milestone_interval
         while not self._stop.wait(self.interval):
-            line = self.stats.render_status_line()
-            sys.stderr.write("\r" + line + "\033[K")
-            sys.stderr.flush()
+            elapsed = time.monotonic() - self.stats.start
+            if elapsed >= next_milestone:
+                sys.stdout.write("\n" + self.stats.render_milestone() + "\n")
+                sys.stdout.flush()
+                next_milestone = elapsed + self.milestone_interval
+            if self._stderr_tty:
+                line = self.stats.render_status_line()
+                sys.stderr.write("\r" + line + "\033[K")
+                sys.stderr.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +417,8 @@ def main() -> int:
     ap.add_argument("--out", default="download", type=Path)
     ap.add_argument("--tor", default="127.0.0.1:9050",
                     help="Tor SOCKS5 proxy as host:port, or empty string to disable")
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=10,
+                    help="Number of concurrent downloads (default: 10)")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--filter", default="")
     ap.add_argument("--retries", type=int, default=3)
@@ -357,11 +440,15 @@ def main() -> int:
 
     total_bytes = sum(s for _, s in files)
     total_files = len(files)
+    started_wall = datetime.now()
     print(
-        f"Planning {total_files:,} downloads "
-        f"({total_bytes / (1024 ** 3):.2f} GiB) into {args.out}",
+        f"{bold('Planning')} {total_files:,} downloads "
+        f"({fmt_gib(total_bytes)}) into {cyan(args.out)}",
         flush=True,
     )
+    print(f"  workers : {args.workers}   tor : {args.tor}   started : {started_wall:%Y-%m-%d %H:%M:%S}",
+          flush=True)
+    print(flush=True)
 
     args.out.mkdir(parents=True, exist_ok=True)
     session = make_session(args.tor or None)
@@ -390,19 +477,19 @@ def main() -> int:
                 counts[bucket] += 1
 
                 if status == "ok":
-                    tag = "OK  "
+                    tag = green("OK  ")
                 elif status == "skip":
-                    tag = "SKIP"
+                    tag = grey("SKIP")
                 elif status == "missing":
-                    tag = "404 "
+                    tag = yellow("404 ")
                 else:
-                    tag = "ERR "
+                    tag = red("ERR ")
 
                 if status == "ok" and size > 0:
                     speed_bps = received / elapsed if elapsed > 0 else 0
                     timing = f"in {fmt_duration(elapsed):>5} ({fmt_speed(speed_bps)})"
                 elif status == "skip":
-                    timing = "already present     "
+                    timing = grey("already present     ")
                 else:
                     timing = f"{elapsed:>5.1f}s              "
                 print(
@@ -413,17 +500,23 @@ def main() -> int:
         reporter.stop()
         if reporter.is_alive():
             reporter.join(timeout=2)
-        if reporter._enabled:
+        if reporter._stderr_tty:
             sys.stderr.write("\n")
             sys.stderr.flush()
 
     elapsed_total = time.monotonic() - stats.start
     print()
-    print("Summary:")
-    for k in ("ok", "skip", "missing", "error"):
-        print(f"  {k:>8}: {counts[k]:>7,}")
-    print(f"  {'bytes':>8}: {stats.downloaded / (1024 ** 3):>7.2f} GiB downloaded "
-          f"({stats.lifetime_speed / (1024 ** 2):.2f} MB/s avg over {fmt_duration(elapsed_total)})")
+    print(bold("─── Summary ───────────────────────────────────────────────"))
+    print(f"  {green('ok'):>10}: {counts['ok']:>9,}")
+    print(f"  {grey('skip'):>10}: {counts['skip']:>9,}")
+    print(f"  {yellow('404'):>10}: {counts['missing']:>9,}")
+    print(f"  {red('error'):>10}: {counts['error']:>9,}")
+    print(f"  {'bytes':>10}: {fmt_gib(stats.downloaded).strip()} "
+          f"({fmt_speed(stats.lifetime_speed)} avg over {fmt_duration(elapsed_total)})")
+    print(f"  {'started':>10}: {started_wall:%Y-%m-%d %H:%M:%S}")
+    print(f"  {'finished':>10}: {datetime.now():%Y-%m-%d %H:%M:%S}")
+    print(f"  {'wall time':>10}: {fmt_duration(elapsed_total)}")
+    print("──────────────────────────────────────────────────────────")
     return 0 if counts["error"] == 0 else 2
 
 

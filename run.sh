@@ -112,7 +112,7 @@ TORRC="${TORRC:-$TOR_DIR/torrc}"
 TOR_PIDFILE="${TOR_PIDFILE:-$TOR_DIR/tor.pid}"
 TOR_LOG="${TOR_LOG:-$TOR_DIR/tor.log}"
 
-WORKERS="${WORKERS:-4}"
+WORKERS="${WORKERS:-10}"
 
 # Default listing: ./files.txt in cwd, then $THREEAM_DIR, then fetch from repo
 if [[ -z "$LISTING" ]]; then
