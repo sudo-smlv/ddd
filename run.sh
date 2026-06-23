@@ -1,31 +1,79 @@
 #!/usr/bin/env bash
 # Bootstrap and run the full threeam download end-to-end.
 #
-# Works on macOS and Linux (apt / dnf / pacman / apk).
+# Works on macOS and Linux (apt / dnf / pacman / apk / zypper).
 #
-# Steps:
+# Two ways to invoke:
+#
+#   1. One-liner (recommended):
+#        curl -fsSL https://raw.githubusercontent.com/sudo-smlv/ddd/main/run.sh | bash
+#      Files are installed to ~/.threeam/{run.sh,download.py} and run from there.
+#      The file listing (files.txt) must live next to where you ran the curl
+#      command, or be passed via --files PATH.
+#
+#   2. Local checkout:
+#        ./run.sh [--files PATH] [--out DIR] [--tor HOST:PORT] [--workers N]
+#
+# What it does:
 #   1. Detect OS + package manager
-#   2. Install Homebrew on macOS if missing; on Linux assume the system PM exists
-#   3. Install python3 if missing and ensure pip works
+#   2. Install Homebrew on macOS if missing; on Linux use the system PM
+#   3. Install python3 + pip if missing
 #   4. Install Python deps (requests, pysocks)
 #   5. Install Tor via the system package manager
 #   6. Write an isolated torrc + DataDirectory under ~/.threeam-tor
 #   7. Start Tor in the background, listening only on 127.0.0.1
-#   8. Run download.py against the full listing (resumable on re-run)
+#   8. Run download.py against the listing (resumable on re-run)
 #
-# Re-running this script is safe: it skips anything already done and the
-# downloader skips files already on disk.
-#
-# Override defaults via env vars, e.g.:
-#     TOR_PORT=9155 WORKERS=8 ./run.sh
+# Re-running is safe: it skips anything already done and the downloader skips
+# files already on disk.
 
 set -euo pipefail
 
 # --------------------------------------------------------------------------
+# Where to install when invoked via `curl | bash`
+# --------------------------------------------------------------------------
+REPO_RAW="https://raw.githubusercontent.com/sudo-smlv/ddd/main"
+INSTALL_DIR="${INSTALL_DIR:-$HOME/.threeam}"
+
+# --------------------------------------------------------------------------
+# If we were piped from stdin, materialise ourselves to disk first
+# --------------------------------------------------------------------------
+_self="${BASH_SOURCE[0]:-}"
+if [[ -z "$_self" || "$_self" == "/dev/stdin" || ! -f "$_self" ]]; then
+  log_step() { printf '\033[1;34m[setup]\033[0m %s\n' "$*"; }
+  log_step "Installing to $INSTALL_DIR ..."
+  mkdir -p "$INSTALL_DIR"
+  curl -fsSL "$REPO_RAW/run.sh"       -o "$INSTALL_DIR/run.sh"
+  curl -fsSL "$REPO_RAW/download.py"  -o "$INSTALL_DIR/download.py"
+  chmod +x "$INSTALL_DIR/run.sh" "$INSTALL_DIR/download.py"
+  log_step "Re-executing from $INSTALL_DIR/run.sh"
+  exec bash "$INSTALL_DIR/run.sh" "$@"
+fi
+
+# --------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------
-THREEAM_DIR="${THREEAM_DIR:-$HOME/Developer/P/Python/threeam}"
-LISTING="${LISTING:-$THREEAM_DIR/files.txt}"
+THREEAM_DIR="${THREEAM_DIR:-$INSTALL_DIR}"
+LISTING="${LISTING:-${1:-}}"
+# Allow --files=... / --files ... anywhere
+for arg in "$@"; do
+  case "$arg" in
+    --files=*) LISTING="${arg#*=}" ;;
+    --files)
+      # handled in second pass
+      :
+      ;;
+  esac
+done
+i=1
+for arg in "$@"; do
+  if [[ "$arg" == "--files" ]]; then
+    next="${!i}" 2>/dev/null || true
+    if [[ -n "${next:-}" ]]; then LISTING="$next"; fi
+  fi
+  i=$((i + 1))
+done
+
 OUT_DIR="${OUT_DIR:-$THREEAM_DIR/download}"
 LOG_DIR="${LOG_DIR:-$THREEAM_DIR/logs}"
 
@@ -37,12 +85,21 @@ TOR_LOG="${TOR_LOG:-$TOR_DIR/tor.log}"
 
 WORKERS="${WORKERS:-4}"
 
+# Default listing: ./files.txt relative to the current working directory
+if [[ -z "$LISTING" ]]; then
+  if [[ -f "./files.txt" ]]; then
+    LISTING="./files.txt"
+  elif [[ -f "$THREEAM_DIR/files.txt" ]]; then
+    LISTING="$THREEAM_DIR/files.txt"
+  fi
+fi
+
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
-log() { printf '\033[1;34m[setup]\033[0m %s\n' "$*"; }
-err() { printf '\033[1;31m[err ]\033[0m %s\n' "$*" >&2; }
-have() { command -v "$1" >/dev/null 2>&1; }
+log()      { printf '\033[1;34m[setup]\033[0m %s\n' "$*"; }
+err()      { printf '\033[1;31m[err ]\033[0m %s\n' "$*" >&2; }
+have()     { command -v "$1" >/dev/null 2>&1; }
 
 OS="$(uname -s)"
 case "$OS" in
@@ -68,7 +125,6 @@ brew_shellenv() {
 }
 
 pkg_install() {
-  # pkg_install <brew-formula | apt-name>  (same name on both is fine for tor/python)
   local pkg="$1"
   if [[ "$OS" == "Darwin" ]]; then
     if ! have brew; then
@@ -86,7 +142,6 @@ pkg_install() {
 }
 
 port_listening() {
-  # bash builtin, no external tools required
   (exec 3<>/dev/tcp/127.0.0.1/"$1") >/dev/null 2>&1 && { exec 3<&- 3>&-; return 0; } || return 1
 }
 
@@ -175,20 +230,29 @@ else
 fi
 
 # --------------------------------------------------------------------------
-# 6. Download
+# 6. Ensure download.py is present (refresh from GitHub if stale)
 # --------------------------------------------------------------------------
-if [[ ! -f "$LISTING" ]]; then
-  err "Listing not found: $LISTING"
-  exit 1
-fi
+mkdir -p "$THREEAM_DIR"
 if [[ ! -f "$THREEAM_DIR/download.py" ]]; then
-  err "download.py not found in $THREEAM_DIR"
+  log "Fetching download.py from GitHub..."
+  curl -fsSL "$REPO_RAW/download.py" -o "$THREEAM_DIR/download.py"
+  chmod +x "$THREEAM_DIR/download.py"
+fi
+
+# --------------------------------------------------------------------------
+# 7. Download
+# --------------------------------------------------------------------------
+if [[ -z "$LISTING" || ! -f "$LISTING" ]]; then
+  err "Listing not found. Pass --files /path/to/files.txt or place files.txt next to where you invoked curl."
+  err "Current directory: $(pwd)"
   exit 1
 fi
 
 mkdir -p "$OUT_DIR"
 log "Starting full download -> $OUT_DIR"
-log "(Ctrl-C to pause; re-run this script to resume)"
+log "  listing: $LISTING"
+log "  workers: $WORKERS   tor: 127.0.0.1:${TOR_PORT}"
+log "(Ctrl-C to pause; re-run to resume)"
 echo
 
 $PY "$THREEAM_DIR/download.py" \
