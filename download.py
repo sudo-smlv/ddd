@@ -200,6 +200,7 @@ class Stats:
         self.downloaded = 0
         self.lock = threading.Lock()
         self.window: collections.deque[tuple[float, int]] = collections.deque()
+        self.speed_history: collections.deque[float] = collections.deque(maxlen=60)
         self.start = time.monotonic()
         self._last_status_len = 0
 
@@ -250,20 +251,22 @@ class Stats:
         return remaining / speed
 
     def render_status_line(self) -> str:
-        """Short status line for live TTY updates."""
+        """Single-line live status for TTY stderr."""
         elapsed = time.monotonic() - self.start
         pct = 100.0 * self.downloaded / self.total_bytes if self.total_bytes else 0.0
         speed = self.rolling_speed or self.lifetime_speed
+        eta = self.eta_seconds
+        done = self.completed_files
         return (
-            f"[{render_bar(pct)}] {pct:5.2f}%  "
-            f"{fmt_gib(self.downloaded)} / {fmt_gib(self.total_bytes)}  "
-            f"| {fmt_speed(speed)}  "
-            f"| ETA {fmt_duration(self.eta_seconds)}  "
-            f"| finish {fmt_clock(self.eta_seconds)}  "
-            f"| {self.completed_files:,}/{self.total_files:,} files  "
-            f"| active {self.active_files}  "
-            f"| err {self.error_files}  "
-            f"| {fmt_duration(elapsed)}"
+            f"[{render_bar(pct)}] {pct:5.2f}%   "
+            f"{fmt_gib(self.downloaded)} / {fmt_gib(self.total_bytes)}   "
+            f"↑ {fmt_speed(speed)}   "
+            f"⏱  ETA {fmt_duration(eta)}   "
+            f"🕒 finish {fmt_clock(eta)}   "
+            f"⚡ {done:,}/{self.total_files:,} done   "
+            f"workers {self.active_files}   "
+            f"errors {self.error_files}   "
+            f"elapsed {fmt_duration(elapsed)}"
         )
 
     def render_milestone(self) -> str:
@@ -279,18 +282,45 @@ class Stats:
             done = self.completed_files
             errors = self.error_files
         clock_now = datetime.now().strftime("%H:%M:%S")
-        return (
-            f"[{clock_now}] {bold('checkpoint')} "
-            f"[{render_bar(pct)}] {pct:5.2f}%\n"
-            f"        downloaded : {fmt_gib(self.downloaded)} of {fmt_gib(self.total_bytes)} "
-            f"({fmt_gib(remaining)} left)\n"
-            f"        files      : {done:,} done / {self.total_files:,} total "
-            f"(active {active}, errors {errors})\n"
-            f"        speed      : {fmt_speed(rolling)} rolling  |  "
-            f"{fmt_speed(speed)} avg since start\n"
-            f"        time       : elapsed {fmt_duration(elapsed)}  |  "
-            f"ETA {fmt_duration(eta)}  |  finish {fmt_clock(eta)}"
-        )
+        w = 68
+        bar = render_bar(pct, width=40)
+        sparkline = self._sparkline()
+        rows = [
+            (f"[{clock_now}] {bold('checkpoint')}", ""),
+            (bar, f"{pct:6.2f}%"),
+            ("", ""),
+            ("Files",       f"{done:,} / {self.total_files:,} done   ({active} active, {errors} errors)"),
+            ("Downloaded",  f"{fmt_gib(self.downloaded).strip()} / {fmt_gib(self.total_bytes).strip()}   "
+                            f"({fmt_gib(remaining).strip()} remaining)"),
+            ("Speed",       f"{fmt_speed(rolling)} rolling (60s)   {fmt_speed(speed)} avg"),
+            ("History",     sparkline),
+            ("Elapsed",     f"{fmt_duration(elapsed)}"),
+            ("ETA",         f"{fmt_duration(eta)}   (finish {fmt_clock(eta)})"),
+        ]
+        lines = []
+        for k, v in rows:
+            if not k and not v:
+                lines.append("")
+                continue
+            if v == "":
+                lines.append(v)
+            else:
+                lines.append(f"  {grey(k + ':').ljust(13)} {v}")
+        return "\n".join(lines)
+
+    def _sparkline(self) -> str:
+        """Render last 30 speed samples as unicode sparkline."""
+        if len(self.speed_history) < 2:
+            return "(collecting samples...)"
+        bars = "▁▂▃▄▅▆▇█"
+        samples = list(self.speed_history)[-30:]
+        mx = max(samples) or 1
+        return "".join(bars[min(len(bars) - 1, int(s / mx * (len(bars) - 1)))] for s in samples) + \
+               f"  (now {fmt_speed(samples[-1])})"
+
+    def record_checkpoint_speed(self) -> None:
+        with self.lock:
+            self.speed_history.append(self.rolling_speed or self.lifetime_speed)
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +459,7 @@ class Reporter(threading.Thread):
         while not self._stop.wait(self.interval):
             elapsed = time.monotonic() - self.stats.start
             if elapsed >= next_milestone:
+                self.stats.record_checkpoint_speed()
                 sys.stdout.write("\n" + self.stats.render_milestone() + "\n")
                 sys.stdout.flush()
                 next_milestone = elapsed + self.milestone_interval
@@ -476,13 +507,23 @@ def main() -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     proxies = parse_proxies(args.tor or None)
 
-    print(
-        f"{bold('Planning')} {total_files:,} downloads "
-        f"({fmt_gib(total_bytes)}) into {cyan(args.out)}",
-        flush=True,
+    banner = (
+        f"{cyan('╔══════════════════════════════════════════════════════════════════╗')}\n"
+        f"{cyan('║')}                  {bold('threeam downloader')}                                {cyan('║')}\n"
+        f"{cyan('╚══════════════════════════════════════════════════════════════════╝')}"
     )
-    print(f"  workers : {args.workers}   tor : {len(proxies)} instance(s) ({args.tor})   started : {started_wall:%Y-%m-%d %H:%M:%S}",
-          flush=True)
+    print(banner, flush=True)
+    info_lines = [
+        ("Files",       f"{total_files:,}"),
+        ("Total size",  fmt_gib(total_bytes).strip()),
+        ("Output",      args.out),
+        ("Workers",     str(args.workers)),
+        ("Tor proxies", f"{len(proxies)} ({', '.join(p.split('://')[-1] for p in proxies if p) or 'direct'})"),
+        ("Started",     started_wall.strftime("%Y-%m-%d %H:%M:%S")),
+    ]
+    label_w = max(len(k) for k, _ in info_lines)
+    for k, v in info_lines:
+        print(f"  {grey(k + ':').ljust(label_w + 1)} {v}", flush=True)
     print(flush=True)
 
     stats = Stats(total_bytes=total_bytes, total_files=total_files)
@@ -511,23 +552,34 @@ def main() -> int:
                 counts[bucket] += 1
 
                 if status == "ok":
+                    icon = green("✓")
                     tag = green("OK  ")
                 elif status == "skip":
+                    icon = grey("⊘")
                     tag = grey("SKIP")
                 elif status == "missing":
+                    icon = yellow("⚠")
                     tag = yellow("404 ")
                 else:
+                    icon = red("✗")
                     tag = red("ERR ")
 
                 if status == "ok" and size > 0:
                     speed_bps = received / elapsed if elapsed > 0 else 0
-                    timing = f"in {fmt_duration(elapsed):>5} ({fmt_speed(speed_bps)})"
+                    timing = f"{fmt_duration(elapsed):>5} {fmt_speed(speed_bps):>9}"
                 elif status == "skip":
-                    timing = grey("already present     ")
+                    timing = grey("already present            ")
+                elif status == "missing":
+                    timing = grey("not on server              ")
                 else:
-                    timing = f"{elapsed:>5.1f}s              "
+                    detail = status.split(":", 1)[-1].strip()[:30]
+                    timing = f"{elapsed:>4.0f}s {grey(detail):<29}"
+                rel_display = rel.replace("\\", "/")
+                if len(rel_display) > 80:
+                    rel_display = "…" + rel_display[-79:]
                 print(
-                    f"[{i:>6}/{total_files}] {tag} {size:>14,}  {timing}  {rel}",
+                    f"  {icon} [{i:>6}/{total_files}]  {tag}  "
+                    f"{size:>12,}  {timing}   {rel_display}",
                     flush=True,
                 )
     finally:
@@ -539,18 +591,32 @@ def main() -> int:
             sys.stderr.flush()
 
     elapsed_total = time.monotonic() - stats.start
+    finished_wall = datetime.now()
     print()
-    print(bold("─── Summary ───────────────────────────────────────────────"))
-    print(f"  {green('ok'):>10}: {counts['ok']:>9,}")
-    print(f"  {grey('skip'):>10}: {counts['skip']:>9,}")
-    print(f"  {yellow('404'):>10}: {counts['missing']:>9,}")
-    print(f"  {red('error'):>10}: {counts['error']:>9,}")
-    print(f"  {'bytes':>10}: {fmt_gib(stats.downloaded).strip()} "
-          f"({fmt_speed(stats.lifetime_speed)} avg over {fmt_duration(elapsed_total)})")
-    print(f"  {'started':>10}: {started_wall:%Y-%m-%d %H:%M:%S}")
-    print(f"  {'finished':>10}: {datetime.now():%Y-%m-%d %H:%M:%S}")
-    print(f"  {'wall time':>10}: {fmt_duration(elapsed_total)}")
-    print("──────────────────────────────────────────────────────────")
+    w = 70
+    print(cyan("═" * w))
+    print(cyan("║") + bold("{:^68}".format("COMPLETED" if counts["error"] == 0 else "FINISHED WITH ERRORS")).center(68) + cyan("║"))
+    print(cyan("═" * w))
+    summary_rows = [
+        (green("✓ ok"),      counts["ok"]),
+        (grey("⊘ skipped"), counts["skip"]),
+        (yellow("⚠ 404"),     counts["missing"]),
+        (red("✗ errors"),  counts["error"]),
+    ]
+    for label, count in summary_rows:
+        print(f"  {label:<14}  {count:>9,}")
+    print()
+    metric_rows = [
+        ("Total",        fmt_gib(stats.downloaded).strip()),
+        ("Avg speed",    f"{fmt_speed(stats.lifetime_speed)}"),
+        ("Wall time",    fmt_duration(elapsed_total)),
+        ("Started",      started_wall.strftime("%Y-%m-%d %H:%M:%S")),
+        ("Finished",     finished_wall.strftime("%Y-%m-%d %H:%M:%S")),
+    ]
+    label_w = max(len(k) for k, _ in metric_rows)
+    for k, v in metric_rows:
+        print(f"  {grey((k + ':')).ljust(label_w + 1)} {v}")
+    print(cyan("─" * w))
     return 0 if counts["error"] == 0 else 2
 
 
