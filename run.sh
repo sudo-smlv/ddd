@@ -40,7 +40,7 @@ have()     { command -v "$1" >/dev/null 2>&1; }
 # Where to install when invoked via `curl | bash`
 # Default: a `threeam/` subdirectory of the directory the user is in.
 # --------------------------------------------------------------------------
-REPO_RAW="https://cdn.jsdelivr.net/gh/sudo-smlv/ddd@main"
+REPO_RAW="https://raw.githubusercontent.com/sudo-smlv/ddd/HEAD"
 : "${INSTALL_DIR:=}"
 if [[ -z "$INSTALL_DIR" ]]; then
   if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "/dev/stdin" && -f "${BASH_SOURCE[0]}" ]]; then
