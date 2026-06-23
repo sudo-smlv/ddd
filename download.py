@@ -473,6 +473,9 @@ def main() -> int:
     total_bytes = sum(s for _, s in files)
     total_files = len(files)
     started_wall = datetime.now()
+    args.out.mkdir(parents=True, exist_ok=True)
+    proxies = parse_proxies(args.tor or None)
+
     print(
         f"{bold('Planning')} {total_files:,} downloads "
         f"({fmt_gib(total_bytes)}) into {cyan(args.out)}",
@@ -482,8 +485,6 @@ def main() -> int:
           flush=True)
     print(flush=True)
 
-    args.out.mkdir(parents=True, exist_ok=True)
-    proxies = parse_proxies(args.tor or None)
     stats = Stats(total_bytes=total_bytes, total_files=total_files)
 
     reporter = Reporter(stats)
