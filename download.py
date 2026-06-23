@@ -69,7 +69,7 @@ USER_AGENT = "Mozilla/5.0 (threeam-downloader/1.0)"
 CHUNK_SIZE = 64 * 1024
 SPEED_WINDOW_SEC = 60.0
 STATUS_INTERVAL_SEC = 1.0
-MILESTONE_INTERVAL_SEC = 15.0
+MILESTONE_INTERVAL_SEC = 10.0
 BAR_WIDTH = 28
 
 # ---------------------------------------------------------------------------
@@ -542,7 +542,9 @@ class Reporter(threading.Thread):
         self._stop.set()
 
     def run(self) -> None:
-        next_milestone = self.milestone_interval
+        # First checkpoint at 3s (so user sees progress quickly even if
+        # workers are slow), then every milestone_interval after that.
+        next_milestone = 3.0
         while not self._stop.wait(self.interval):
             elapsed = time.monotonic() - self.stats.start
             if elapsed >= next_milestone:
@@ -632,6 +634,11 @@ def main() -> int:
     loaded = history.loaded_count()
     print(f"  history     : {grey(str(history_path))}  ({loaded:,} prior records)" if loaded else
           f"  history     : {grey(str(history_path))}  (new)", flush=True)
+    print(flush=True)
+    print(f"{cyan('▶')} Starting {args.workers} workers across {len(proxies)} Tor instance(s)...", flush=True)
+    print(f"{grey('  checkpoints every 10s. Per-file lines for errors, files >= 1 MiB, and every {args.file_sample}th completion.')}",
+          flush=True)
+    print(f"{grey('  Press Ctrl-C to pause; re-run to resume.')}", flush=True)
     print(flush=True)
 
     reporter = Reporter(stats)
