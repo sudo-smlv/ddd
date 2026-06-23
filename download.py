@@ -69,7 +69,7 @@ USER_AGENT = "Mozilla/5.0 (threeam-downloader/1.0)"
 CHUNK_SIZE = 64 * 1024
 SPEED_WINDOW_SEC = 60.0
 STATUS_INTERVAL_SEC = 1.0
-MILESTONE_INTERVAL_SEC = 30.0
+MILESTONE_INTERVAL_SEC = 15.0
 BAR_WIDTH = 28
 
 # ---------------------------------------------------------------------------
@@ -271,7 +271,7 @@ class Stats:
         )
 
     def render_milestone(self) -> str:
-        """Multi-line checkpoint written to stdout (captured in tee'd logs)."""
+        """Boxed multi-line checkpoint written to stdout."""
         elapsed = time.monotonic() - self.start
         pct = 100.0 * self.downloaded / self.total_bytes if self.total_bytes else 0.0
         speed = self.lifetime_speed
@@ -283,30 +283,38 @@ class Stats:
             done = self.completed_files
             errors = self.error_files
         clock_now = datetime.now().strftime("%H:%M:%S")
-        w = 68
-        bar = render_bar(pct, width=40)
+        bar = render_bar(pct, width=44)
         sparkline = self._sparkline()
-        rows = [
-            (f"[{clock_now}] {bold('checkpoint')}", ""),
-            (bar, f"{pct:6.2f}%"),
-            ("", ""),
-            ("Files",       f"{done:,} / {self.total_files:,} done   ({active} active, {errors} errors)"),
-            ("Downloaded",  f"{fmt_gib(self.downloaded).strip()} / {fmt_gib(self.total_bytes).strip()}   "
-                            f"({fmt_gib(remaining).strip()} remaining)"),
-            ("Speed",       f"{fmt_speed(rolling)} rolling (60s)   {fmt_speed(speed)} avg"),
-            ("History",     sparkline),
-            ("Elapsed",     f"{fmt_duration(elapsed)}"),
-            ("ETA",         f"{fmt_duration(eta)}   (finish {fmt_clock(eta)})"),
+        W = 72
+        top    = cyan("╔" + "═" * (W - 2) + "╗")
+        sep    = cyan("╟" + "─" * (W - 2) + "╢")
+        bottom = cyan("╚" + "═" * (W - 2) + "╝")
+
+        def row(k: str, v: str) -> str:
+            content = f" {bold(k):<12} {v}"
+            pad = max(1, W - 2 - len(content))
+            return cyan("║") + content + (" " * pad) + cyan("║")
+
+        def plain(content: str) -> str:
+            pad = max(1, W - 2 - len(content))
+            return cyan("║") + content + (" " * pad) + cyan("║")
+
+        lines = [
+            "",
+            top,
+            plain(f"{bold('checkpoint')}  {grey(clock_now)}"),
+            sep,
+            plain(f"{bar}  {pct:6.2f}%"),
+            sep,
+            row("Files",      f"{done:,} / {self.total_files:,}   ({active} active, {errors} errors)"),
+            row("Downloaded", f"{fmt_gib(self.downloaded).strip()} / {fmt_gib(self.total_bytes).strip()}   "
+                               f"({fmt_gib(remaining).strip()} left)"),
+            row("Speed",      f"{fmt_speed(rolling)} rolling (60s)   {fmt_speed(speed)} avg"),
+            row("History",    sparkline),
+            row("Elapsed",    fmt_duration(elapsed)),
+            row("ETA",        f"{fmt_duration(eta)}   finish {fmt_clock(eta)}"),
+            bottom,
         ]
-        lines = []
-        for k, v in rows:
-            if not k and not v:
-                lines.append("")
-                continue
-            if v == "":
-                lines.append(v)
-            else:
-                lines.append(f"  {grey(k + ':').ljust(13)} {v}")
         return "\n".join(lines)
 
     def _sparkline(self) -> str:
@@ -571,6 +579,11 @@ def main() -> int:
                     help="Ignore history: re-download every file even if previously OK")
     ap.add_argument("--no-history", action="store_true",
                     help="Don't persist or load .history.json (always retry everything except on-disk files)")
+    ap.add_argument("--show-files", choices=["always", "sampled", "errors"], default="sampled",
+                    help="Print per-file lines: 'always', 'sampled' (errors + >=1MiB + every Nth), "
+                         "or 'errors' (errors only). Default: sampled.")
+    ap.add_argument("--file-sample", type=int, default=50,
+                    help="When --show-files=sampled, print one per-file line every N completions. Default: 50")
     args = ap.parse_args()
 
     if not args.list.exists():
@@ -672,11 +685,26 @@ def main() -> int:
                 rel_display = rel.replace("\\", "/")
                 if len(rel_display) > 80:
                     rel_display = "…" + rel_display[-79:]
-                print(
-                    f"  {icon} [{i:>6}/{total_files}]  {tag}  "
-                    f"{size:>12,}  {timing}   {rel_display}",
-                    flush=True,
+
+                # Decide whether to print this line. With 2000+ workers files
+                # complete so fast that per-file lines flood stdout and drown
+                # the checkpoint summary. Default mode shows only:
+                #   * every error / 404 / skip
+                #   * files >= 1 MiB
+                #   * every Nth small OK (sampled)
+                # --show-files=always shows all, =none shows nothing.
+                print_line = (
+                    args.show_files == "always"
+                    or status not in ("ok",)
+                    or size >= 1_048_576
+                    or (args.show_files == "sampled" and i % args.file_sample == 0)
                 )
+                if print_line:
+                    print(
+                        f"  {icon} [{i:>6}/{total_files}]  {tag}  "
+                        f"{size:>12,}  {timing}   {rel_display}",
+                        flush=True,
+                    )
     finally:
         reporter.stop()
         if reporter.is_alive():

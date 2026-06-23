@@ -93,7 +93,6 @@ fi
 # --------------------------------------------------------------------------
 THREEAM_DIR="${THREEAM_DIR:-$INSTALL_DIR}"
 LISTING="${LISTING:-}"
-log "DEBUG: INSTALL_DIR=$INSTALL_DIR  THREEAM_DIR=$THREEAM_DIR  INSTALL_DIR/files.txt exists? $([[ -f "$INSTALL_DIR/files.txt" ]] && echo yes || echo no)  THREEAM_DIR/files.txt exists? $([[ -f "$THREEAM_DIR/files.txt" ]] && echo yes || echo no)"
 # Parse CLI args. They can be set as either env vars (before `| bash`) or as
 # arguments after `bash -s -- ...` (after the pipe). The argument form
 # overrides env vars and is the only one that survives `curl ... | bash`.
@@ -104,6 +103,8 @@ for arg in "$@"; do
     --instances)    TOR_INSTANCES="$arg" ;;
     --workers|--concurrent) WORKERS="$arg" ;;
     --out)          OUT_DIR="$arg" ;;
+    --show-files)   SHOW_FILES="$arg" ;;
+    --file-sample)  FILE_SAMPLE="$arg" ;;
   esac
   case "$arg" in
     --files=*)        LISTING="${arg#*=}" ;;
@@ -111,6 +112,8 @@ for arg in "$@"; do
     --workers=*)      WORKERS="${arg#*=}" ;;
     --concurrent=*)   WORKERS="${arg#*=}" ;;
     --out=*)          OUT_DIR="${arg#*=}" ;;
+    --show-files=*)   SHOW_FILES="${arg#*=}" ;;
+    --file-sample=*)  FILE_SAMPLE="${arg#*=}" ;;
   esac
   prev="$arg"
 done
@@ -379,7 +382,6 @@ if [[ -z "${LISTING:-}" ]]; then
   elif [[ -f "$THREEAM_DIR/files.txt" ]]; then LISTING="$THREEAM_DIR/files.txt"
   fi
 fi
-log "DEBUG: LISTING=[$LISTING]  exists? $([[ -f "$LISTING" ]] && echo yes || echo no)"
 if [[ -z "$LISTING" || ! -f "$LISTING" ]]; then
   err "Listing not found. Pass --files /path/to/files.txt or place files.txt next to where you invoked curl."
   err "Current directory: $(pwd)"
@@ -391,14 +393,20 @@ log "Starting full download -> $OUT_DIR"
 log "  listing    : $LISTING"
 log "  workers    : $WORKERS"
 log "  tor insts  : $TOR_INSTANCES (ports ${TOR_PORTS[*]})"
+log "  show-files : ${SHOW_FILES:-sampled} (sampling every ${FILE_SAMPLE:-50}th file)"
 log "(Ctrl-C to pause; re-run to resume)"
 echo
+
+EXTRA_ARGS=()
+[[ -n "${SHOW_FILES:-}"  ]] && EXTRA_ARGS+=(--show-files "$SHOW_FILES")
+[[ -n "${FILE_SAMPLE:-}" ]] && EXTRA_ARGS+=(--file-sample "$FILE_SAMPLE")
 
 $PY "$THREEAM_DIR/download.py" \
   --list  "$LISTING" \
   --out   "$OUT_DIR" \
   --tor   "$TOR_SPEC" \
   --workers "$WORKERS" \
+  "${EXTRA_ARGS[@]}" \
   2>&1 | tee -a "$LOG_DIR/download.log"
 
 log "Done. To stop all Tor instances:"
