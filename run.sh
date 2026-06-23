@@ -84,22 +84,23 @@ fi
 # --------------------------------------------------------------------------
 THREEAM_DIR="${THREEAM_DIR:-$INSTALL_DIR}"
 LISTING="${LISTING:-${1:-}}"
-# Allow --files=... / --files ... anywhere
-for arg in "$@"; do
-  case "$arg" in
-    --files=*) LISTING="${arg#*=}" ;;
-    --files)
-      # handled in second pass
-      :
-      ;;
-  esac
-done
+# Parse CLI args. They can be set as either env vars (before `| bash`) or as
+# arguments after `bash -s -- ...` (after the pipe). The argument form
+# overrides env vars and is the only one that survives `curl ... | bash`.
 i=1
 for arg in "$@"; do
-  if [[ "$arg" == "--files" ]]; then
-    next="${!i}" 2>/dev/null || true
-    if [[ -n "${next:-}" ]]; then LISTING="$next"; fi
-  fi
+  case "$arg" in
+    --files=*)        LISTING="${arg#*=}" ;;
+    --files)          next="${!i}" 2>/dev/null || true; [[ -n "${next:-}" ]] && LISTING="$next" ;;
+    --instances=*)    TOR_INSTANCES="${arg#*=}" ;;
+    --instances)      next="${!i}" 2>/dev/null || true; [[ -n "${next:-}" ]] && TOR_INSTANCES="$next" ;;
+    --concurrent=*)   WORKERS="${arg#*=}" ;;
+    --concurrent)     next="${!i}" 2>/dev/null || true; [[ -n "${next:-}" ]] && WORKERS="$next" ;;
+    --workers=*)      WORKERS="${arg#*=}" ;;
+    --workers)        next="${!i}" 2>/dev/null || true; [[ -n "${next:-}" ]] && WORKERS="$next" ;;
+    --out=*)          OUT_DIR="${arg#*=}" ;;
+    --out)            next="${!i}" 2>/dev/null || true; [[ -n "${next:-}" ]] && OUT_DIR="$next" ;;
+  esac
   i=$((i + 1))
 done
 
