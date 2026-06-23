@@ -40,7 +40,22 @@ have()     { command -v "$1" >/dev/null 2>&1; }
 # Where to install when invoked via `curl | bash`
 # Default: a `threeam/` subdirectory of the directory the user is in.
 # --------------------------------------------------------------------------
-REPO_RAW="https://raw.githubusercontent.com/sudo-smlv/ddd/HEAD"
+REPO_RAW_BASE="https://raw.githubusercontent.com/sudo-smlv/ddd"
+REPO_CDN_BASE="https://cdn.jsdelivr.net/gh/sudo-smlv/ddd@main"
+
+# Resolve a fresh ref at runtime. raw.githubusercontent.com aggressively
+# caches /main/, so we resolve HEAD's commit SHA via the API and download
+# from a SHA-pinned URL. Falls back to /main/ then jsDelivr.
+REPO_RAW="$REPO_RAW_BASE"
+if command -v curl >/dev/null 2>&1; then
+  _sha=$(curl -fsSL --max-time 8 "https://api.github.com/repos/sudo-smlv/ddd/commits/main" \
+         | python3 -c "import json,sys;print(json.load(sys.stdin).get('sha',''))" 2>/dev/null || true)
+  if [[ -n "$_sha" ]]; then
+    REPO_RAW="$REPO_RAW_BASE/$_sha"
+  else
+    REPO_RAW="$REPO_RAW_BASE/HEAD"
+  fi
+fi
 : "${INSTALL_DIR:=}"
 if [[ -z "$INSTALL_DIR" ]]; then
   if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "/dev/stdin" && -f "${BASH_SOURCE[0]}" ]]; then
