@@ -108,8 +108,9 @@ LOG_DIR="${LOG_DIR:-$THREEAM_DIR/logs}"
 
 TOR_DIR="${TOR_DIR:-$HOME/.threeam-tor}"
 TOR_PORT="${TOR_PORT:-9151}"
-TOR_INSTANCES="${TOR_INSTANCES:-10}"
+TOR_INSTANCES="${TOR_INSTANCES:-5}"
 WORKERS="${WORKERS:-500}"
+TOR_START_STAGGER="${TOR_START_STAGGER:-3}"
 
 # Bump file-descriptor limit so 500 workers + 10 Tor instances can each hold
 # their sockets open. Linux default is often 1024.
@@ -264,13 +265,9 @@ for idx in "${!TOR_PORTS[@]}"; do
 SocksPort 127.0.0.1:${port}
 DataDirectory ${inst_dir}/data
 Log notice stdout
-# Allow Tor to multiplex many streams onto one circuit - critical for
-# getting aggregate throughput when 500 workers share one process.
-IsolateClientAddr 0
-IsolateSOCKSAuth 0
-IsolateClientProtocol 0
-IsolateDestPort 0
-IsolateDestAddr 0
+# KeepAlive helps the downloader reuse the same TCP connection across
+# many HTTP requests inside one worker, avoiding handshake overhead.
+SocksPolicy accept 127.0.0.1
 MaxClientCircuitsPending 64
 EOF
 done
@@ -301,22 +298,47 @@ for idx in "${!TOR_PORTS[@]}"; do
   log "Starting Tor #$i on 127.0.0.1:${port} (logs: $log_file)..."
   nohup tor -f "$inst_dir/torrc" >"$log_file" 2>&1 &
   echo $! > "$pid_file"
+  # Stagger so they don't all hammer the Tor directory at once
+  sleep "$TOR_START_STAGGER"
 done
 
-# Wait for all instances to be ready
+# Wait for instances to be ready. Tolerate partial failures: if some
+# instances don't bootstrap, drop them from TOR_PORTS and continue.
+WAIT_TIMEOUT=180
 for idx in "${!TOR_PORTS[@]}"; do
   port="${TOR_PORTS[$idx]}"
-  for i in {1..120}; do
-    port_listening "$port" && break
+  i=$((idx + 1))
+  log "Waiting for Tor #$i (port $port)..."
+  last_pct=0
+  for s in $(seq 1 $WAIT_TIMEOUT); do
+    if port_listening "$port"; then
+      log "Tor #$i up on 127.0.0.1:$port (after ${s}s)"
+      break
+    fi
+    if [[ $((s % 10)) -eq 0 ]]; then
+      ready_count=0
+      for p in "${TOR_PORTS[@]}"; do
+        port_listening "$p" && ready_count=$((ready_count + 1))
+      done
+      log "  ... ${s}s elapsed, $ready_count/${#TOR_PORTS[@]} instances ready"
+    fi
     sleep 1
-    if [[ $i -eq 120 ]]; then
-      err "Tor on port $port did not become ready in 120s. Last lines of $TOR_DIR/instance-$((idx+1))/tor.log:"
-      tail -n 20 "$TOR_DIR/instance-$((idx+1))/tor.log" >&2 || true
-      exit 1
+    if [[ $s -eq $WAIT_TIMEOUT ]]; then
+      err "Tor #$i (port $port) did not become ready in ${WAIT_TIMEOUT}s. Last lines of $TOR_DIR/instance-$i/tor.log:"
+      tail -n 15 "$TOR_DIR/instance-$i/tor.log" >&2 || true
+      # Drop this instance from the list
+      TOR_PORTS=("${TOR_PORTS[@]:0:$idx}" "${TOR_PORTS[@]:$((idx+1))}")
+      idx=$((idx - 1))
     fi
   done
 done
-log "All $TOR_INSTANCES Tor instances up on ports ${TOR_PORTS[*]}"
+
+if [[ ${#TOR_PORTS[@]} -eq 0 ]]; then
+  err "No Tor instances became ready. Check $TOR_DIR/instance-1/tor.log"
+  exit 1
+fi
+
+log "${#TOR_PORTS[@]}/$TOR_INSTANCES Tor instances up on ports ${TOR_PORTS[*]}"
 
 # Comma-separated host:port list for download.py
 TOR_SPEC=$(IFS=,; echo "${TOR_PORTS[*]/#/127.0.0.1:}")
