@@ -108,13 +108,12 @@ LOG_DIR="${LOG_DIR:-$THREEAM_DIR/logs}"
 
 TOR_DIR="${TOR_DIR:-$HOME/.threeam-tor}"
 TOR_PORT="${TOR_PORT:-9151}"
-TOR_INSTANCES="${TOR_INSTANCES:-5}"
-WORKERS="${WORKERS:-500}"
-TOR_START_STAGGER="${TOR_START_STAGGER:-3}"
+TOR_INSTANCES="${TOR_INSTANCES:-50}"
+WORKERS="${WORKERS:-5000}"
+TOR_START_STAGGER="${TOR_START_STAGGER:-2}"
 
-# Bump file-descriptor limit so 500 workers + 10 Tor instances can each hold
-# their sockets open. Linux default is often 1024.
-ulimit -n 65536 2>/dev/null || true
+# File descriptors: 5000 workers + 50 Tor daemons + housekeeping.
+ulimit -n 131072 2>/dev/null || true
 
 # Default listing: ./files.txt in cwd, then $THREEAM_DIR, then fetch from repo
 if [[ -z "$LISTING" ]]; then
@@ -265,10 +264,8 @@ for idx in "${!TOR_PORTS[@]}"; do
 SocksPort 127.0.0.1:${port}
 DataDirectory ${inst_dir}/data
 Log notice stdout
-# KeepAlive helps the downloader reuse the same TCP connection across
-# many HTTP requests inside one worker, avoiding handshake overhead.
 SocksPolicy accept 127.0.0.1
-MaxClientCircuitsPending 64
+MaxClientCircuitsPending 128
 EOF
 done
 
