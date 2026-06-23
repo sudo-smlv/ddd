@@ -379,6 +379,7 @@ if [[ -z "${LISTING:-}" ]]; then
   elif [[ -f "$THREEAM_DIR/files.txt" ]]; then LISTING="$THREEAM_DIR/files.txt"
   fi
 fi
+log "DEBUG: LISTING=[$LISTING]  exists? $([[ -f "$LISTING" ]] && echo yes || echo no)"
 if [[ -z "$LISTING" || ! -f "$LISTING" ]]; then
   err "Listing not found. Pass --files /path/to/files.txt or place files.txt next to where you invoked curl."
   err "Current directory: $(pwd)"
