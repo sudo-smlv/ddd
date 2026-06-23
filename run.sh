@@ -137,18 +137,37 @@ OS="$(uname -s)"
 SUDO=""
 if [[ $EUID -ne 0 ]] && have sudo; then SUDO="sudo"; fi
 case "$OS" in
-  Darwin) PKG_INSTALL="brew install" ;;
+  Darwin) PKG_FAMILY="brew" ;;
   Linux)
-    if have apt-get;     then PKG_INSTALL="$SUDO apt-get update >/dev/null && $SUDO apt-get install -y"
-    elif have dnf;       then PKG_INSTALL="$SUDO dnf install -y"
-    elif have pacman;    then PKG_INSTALL="$SUDO pacman -S --noconfirm"
-    elif have apk;       then PKG_INSTALL="$SUDO apk add --no-cache"
-    elif have zypper;    then PKG_INSTALL="$SUDO zypper install -y"
+    if   have apt-get; then PKG_FAMILY="apt"
+    elif have dnf;     then PKG_FAMILY="dnf"
+    elif have pacman;  then PKG_FAMILY="pacman"
+    elif have apk;     then PKG_FAMILY="apk"
+    elif have zypper;  then PKG_FAMILY="zypper"
     else err "no supported package manager found (need apt/dnf/pacman/apk/zypper)"; exit 1
     fi
     ;;
   *) err "unsupported OS: $OS"; exit 1 ;;
 esac
+
+pkg_update() {
+  case "$PKG_FAMILY" in
+    apt)    eval "$SUDO apt-get update" >/dev/null 2>&1 || true ;;
+    dnf)    eval "$SUDO dnf check-update" >/dev/null 2>&1 || true ;;
+    *)      : ;;  # apk/zypper/pacman refresh lazily on install
+  esac
+}
+
+pkg_install_one() {
+  case "$PKG_FAMILY" in
+    brew)    brew install "$1" ;;
+    apt)     eval "$SUDO apt-get install -y $1" ;;
+    dnf)     eval "$SUDO dnf install -y $1" ;;
+    pacman)  eval "$SUDO pacman -S --noconfirm $1" ;;
+    apk)     eval "$SUDO apk add --no-cache $1" ;;
+    zypper)  eval "$SUDO zypper install -y $1" ;;
+  esac
+}
 
 brew_shellenv() {
   if [[ -x /opt/homebrew/bin/brew ]]; then
@@ -169,11 +188,11 @@ pkg_install() {
     fi
     brew_shellenv
     brew install "$pkg"
-  else
-    # shellcheck disable=SC2086
-    $PKG_INSTALL "$pkg"
   fi
 }
+
+# Backwards-compat alias in case anything still references pkg_install
+pkg_install() { pkg_install_one "$@"; }
 
 port_listening() {
   (exec 3<>/dev/tcp/127.0.0.1/"$1") >/dev/null 2>&1 && { exec 3<&- 3>&-; return 0; } || return 1
@@ -184,16 +203,16 @@ port_listening() {
 # --------------------------------------------------------------------------
 if ! have python3; then
   log "Installing python3..."
-  if [[ "$OS" == "Darwin" ]]; then
-    pkg_install python@3.12
+  if [[ "$PKG_FAMILY" == "brew" ]]; then
+    pkg_install_one python@3.12
     brew_shellenv
   else
-    case "$PKG_INSTALL" in
-      *apt-get*) pkg_install python3 python3-pip ;;
-      *dnf*)     pkg_install python3 python3-pip ;;
-      *pacman*)  pkg_install python python-pip ;;
-      *apk*)     pkg_install python3 py3-pip ;;
-      *)         pkg_install python3 ;;
+    pkg_update
+    case "$PKG_FAMILY" in
+      apt|pacman|zypper) pkg_install_one python3 ; pkg_install_one python3-pip || true ;;
+      dnf)               pkg_install_one python3 ; pkg_install_one python3-pip || true ;;
+      apk)               pkg_install_one python3 ; pkg_install_one py3-pip     || true ;;
+      *)                 pkg_install_one python3 ;;
     esac
   fi
 fi
@@ -221,7 +240,8 @@ $PY -m pip install --user --quiet requests pysocks
 # --------------------------------------------------------------------------
 if ! have tor; then
   log "Installing Tor..."
-  pkg_install tor
+  pkg_update
+  pkg_install_one tor
 fi
 
 # --------------------------------------------------------------------------
