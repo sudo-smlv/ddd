@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import itertools
 import re
 import sys
 import threading
@@ -296,16 +297,46 @@ class Stats:
 # Downloading
 # ---------------------------------------------------------------------------
 
-def make_session(tor: str | None) -> requests.Session:
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
-    if tor:
-        host, _, port = tor.partition(":")
+def parse_proxies(tor_spec: str | None) -> list[str | None]:
+    """Parse --tor into a list of SOCKS5h proxy URLs (or [None] for direct)."""
+    if not tor_spec:
+        return [None]
+    out: list[str | None] = []
+    for raw in tor_spec.split(","):
+        p = raw.strip()
+        if not p:
+            continue
+        host, _, port = p.partition(":")
         if not port:
             port = "9050"
-        proxy = f"socks5h://{host}:{port}"
+        out.append(f"socks5h://{host}:{port}")
+    return out or [None]
+
+
+def make_session(proxy: str | None) -> requests.Session:
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+    if proxy:
         session.proxies = {"http": proxy, "https": proxy}
     return session
+
+
+# Thread-local session: each worker thread sticks to one Tor instance so its
+# circuit stays warm. requests.Session is not generally thread-safe but each
+# thread uses its own, sequentially.
+_tls = threading.local()
+_session_counter = itertools.count()
+
+
+def _get_session(proxies: list[str | None]) -> requests.Session:
+    sess = getattr(_tls, "session", None)
+    if sess is not None:
+        return sess
+    idx = next(_session_counter)
+    proxy = proxies[idx % len(proxies)] if proxies else None
+    sess = make_session(proxy)
+    _tls.session = sess
+    return sess
 
 
 def download_one(
@@ -417,8 +448,9 @@ def main() -> int:
     ap.add_argument("--out", default="download", type=Path)
     ap.add_argument("--tor", default="127.0.0.1:9050",
                     help="Tor SOCKS5 proxy as host:port, or empty string to disable")
-    ap.add_argument("--workers", type=int, default=10,
-                    help="Number of concurrent downloads (default: 10)")
+    ap.add_argument("--workers", type=int, default=500,
+                    help="Number of concurrent downloads (default: 500). "
+                         "Pair with multiple Tor instances via --tor h1:p1,h2:p2 for max throughput.")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--filter", default="")
     ap.add_argument("--retries", type=int, default=3)
@@ -446,12 +478,12 @@ def main() -> int:
         f"({fmt_gib(total_bytes)}) into {cyan(args.out)}",
         flush=True,
     )
-    print(f"  workers : {args.workers}   tor : {args.tor}   started : {started_wall:%Y-%m-%d %H:%M:%S}",
+    print(f"  workers : {args.workers}   tor : {len(proxies)} instance(s) ({args.tor})   started : {started_wall:%Y-%m-%d %H:%M:%S}",
           flush=True)
     print(flush=True)
 
     args.out.mkdir(parents=True, exist_ok=True)
-    session = make_session(args.tor or None)
+    proxies = parse_proxies(args.tor or None)
     stats = Stats(total_bytes=total_bytes, total_files=total_files)
 
     reporter = Reporter(stats)
@@ -461,6 +493,7 @@ def main() -> int:
     counts: dict[str, int] = {"ok": 0, "skip": 0, "missing": 0, "error": 0}
 
     def task(rel: str, size: int) -> tuple[str, int, float, str, int]:
+        session = _get_session(proxies)
         dest = args.out / rel.replace("\\", "/")
         status, elapsed, received = download_one(
             session, build_url(rel), dest,

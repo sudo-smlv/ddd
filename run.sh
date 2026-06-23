@@ -108,11 +108,12 @@ LOG_DIR="${LOG_DIR:-$THREEAM_DIR/logs}"
 
 TOR_DIR="${TOR_DIR:-$HOME/.threeam-tor}"
 TOR_PORT="${TOR_PORT:-9151}"
-TORRC="${TORRC:-$TOR_DIR/torrc}"
-TOR_PIDFILE="${TOR_PIDFILE:-$TOR_DIR/tor.pid}"
-TOR_LOG="${TOR_LOG:-$TOR_DIR/tor.log}"
+TOR_INSTANCES="${TOR_INSTANCES:-10}"
+WORKERS="${WORKERS:-500}"
 
-WORKERS="${WORKERS:-10}"
+# Bump file-descriptor limit so 500 workers + 10 Tor instances can each hold
+# their sockets open. Linux default is often 1024.
+ulimit -n 65536 2>/dev/null || true
 
 # Default listing: ./files.txt in cwd, then $THREEAM_DIR, then fetch from repo
 if [[ -z "$LISTING" ]]; then
@@ -245,43 +246,80 @@ if ! have tor; then
 fi
 
 # --------------------------------------------------------------------------
-# 4. Isolated torrc
+# 4. Multiple Tor instances (one per TOR_INSTANCES count, on consecutive ports)
 # --------------------------------------------------------------------------
-mkdir -p "$TOR_DIR/data" "$LOG_DIR"
-cat > "$TORRC" <<EOF
-SocksPort 127.0.0.1:${TOR_PORT}
-DataDirectory ${TOR_DIR}/data
+mkdir -p "$TOR_DIR" "$LOG_DIR"
+TOR_PORTS=()
+for i in $(seq 1 "$TOR_INSTANCES"); do
+  port=$((TOR_PORT + i - 1))
+  TOR_PORTS+=("$port")
+done
+
+for idx in "${!TOR_PORTS[@]}"; do
+  i=$((idx + 1))
+  port="${TOR_PORTS[$idx]}"
+  inst_dir="$TOR_DIR/instance-$i"
+  mkdir -p "$inst_dir/data"
+  cat > "$inst_dir/torrc" <<EOF
+SocksPort 127.0.0.1:${port}
+DataDirectory ${inst_dir}/data
 Log notice stdout
+# Allow Tor to multiplex many streams onto one circuit - critical for
+# getting aggregate throughput when 500 workers share one process.
+IsolateClientAddr 0
+IsolateSOCKSAuth 0
+IsolateClientProtocol 0
+IsolateDestPort 0
+IsolateDestAddr 0
+MaxClientCircuitsPending 64
 EOF
+done
 
 # --------------------------------------------------------------------------
-# 5. Start Tor
+# 5. Start Tor instances
 # --------------------------------------------------------------------------
-if port_listening "$TOR_PORT"; then
-  log "Tor already listening on 127.0.0.1:${TOR_PORT}, reusing it"
-elif pgrep -f "tor -f ${TORRC}" >/dev/null 2>&1; then
-  log "Tor already running with our config, waiting for port ${TOR_PORT}..."
-  for _ in {1..90}; do
-    port_listening "$TOR_PORT" && break
+for idx in "${!TOR_PORTS[@]}"; do
+  i=$((idx + 1))
+  port="${TOR_PORTS[$idx]}"
+  inst_dir="$TOR_DIR/instance-$i"
+  log_file="$inst_dir/tor.log"
+  pid_file="$inst_dir/tor.pid"
+
+  if port_listening "$port"; then
+    log "Tor #$i already listening on 127.0.0.1:${port}, reusing"
+    continue
+  fi
+  if pgrep -f "tor -f ${inst_dir}/torrc" >/dev/null 2>&1; then
+    log "Tor #$i already running, waiting for port ${port}..."
+    for _ in {1..120}; do
+      port_listening "$port" && break
+      sleep 1
+    done
+    continue
+  fi
+
+  log "Starting Tor #$i on 127.0.0.1:${port} (logs: $log_file)..."
+  nohup tor -f "$inst_dir/torrc" >"$log_file" 2>&1 &
+  echo $! > "$pid_file"
+done
+
+# Wait for all instances to be ready
+for idx in "${!TOR_PORTS[@]}"; do
+  port="${TOR_PORTS[$idx]}"
+  for i in {1..120}; do
+    port_listening "$port" && break
     sleep 1
-  done
-else
-  log "Starting Tor (logs: $TOR_LOG)..."
-  nohup tor -f "$TORRC" >"$TOR_LOG" 2>&1 &
-  echo $! > "$TOR_PIDFILE"
-  for i in {1..90}; do
-    if port_listening "$TOR_PORT"; then
-      log "Tor is up on 127.0.0.1:${TOR_PORT} (pid $(cat "$TOR_PIDFILE"))"
-      break
-    fi
-    sleep 1
-    if [[ $i -eq 90 ]]; then
-      err "Tor did not become ready in 90s. Last 30 lines of $TOR_LOG:"
-      tail -n 30 "$TOR_LOG" >&2 || true
+    if [[ $i -eq 120 ]]; then
+      err "Tor on port $port did not become ready in 120s. Last lines of $TOR_DIR/instance-$((idx+1))/tor.log:"
+      tail -n 20 "$TOR_DIR/instance-$((idx+1))/tor.log" >&2 || true
       exit 1
     fi
   done
-fi
+done
+log "All $TOR_INSTANCES Tor instances up on ports ${TOR_PORTS[*]}"
+
+# Comma-separated host:port list for download.py
+TOR_SPEC=$(IFS=,; echo "${TOR_PORTS[*]/#/127.0.0.1:}")
 
 # --------------------------------------------------------------------------
 # 6. Ensure download.py is present (refresh from GitHub if stale)
@@ -304,16 +342,20 @@ fi
 
 mkdir -p "$OUT_DIR"
 log "Starting full download -> $OUT_DIR"
-log "  listing: $LISTING"
-log "  workers: $WORKERS   tor: 127.0.0.1:${TOR_PORT}"
+log "  listing    : $LISTING"
+log "  workers    : $WORKERS"
+log "  tor insts  : $TOR_INSTANCES (ports ${TOR_PORTS[*]})"
 log "(Ctrl-C to pause; re-run to resume)"
 echo
 
 $PY "$THREEAM_DIR/download.py" \
   --list  "$LISTING" \
   --out   "$OUT_DIR" \
-  --tor   "127.0.0.1:${TOR_PORT}" \
+  --tor   "$TOR_SPEC" \
   --workers "$WORKERS" \
   2>&1 | tee -a "$LOG_DIR/download.log"
 
-log "Done. To stop Tor: kill \$(cat $TOR_PIDFILE)"
+log "Done. To stop all Tor instances:"
+for idx in "${!TOR_PORTS[@]}"; do
+  echo "    kill \$(cat $TOR_DIR/instance-$((idx+1))/tor.pid)" >&2
+done
