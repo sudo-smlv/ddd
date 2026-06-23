@@ -85,11 +85,20 @@ TOR_LOG="${TOR_LOG:-$TOR_DIR/tor.log}"
 
 WORKERS="${WORKERS:-4}"
 
-# Default listing: ./files.txt relative to the current working directory
+# Default listing: ./files.txt in cwd, then $THREEAM_DIR, then fetch from repo
 if [[ -z "$LISTING" ]]; then
   if [[ -f "./files.txt" ]]; then
     LISTING="./files.txt"
   elif [[ -f "$THREEAM_DIR/files.txt" ]]; then
+    LISTING="$THREEAM_DIR/files.txt"
+  else
+    log "files.txt not found locally, fetching from $REPO_RAW/files.txt ..."
+    mkdir -p "$THREEAM_DIR"
+    if ! curl -fSL "$REPO_RAW/files.txt" -o "$THREEAM_DIR/files.txt"; then
+      err "Failed to download files.txt from $REPO_RAW/files.txt"
+      err "Re-run with --files /path/to/files.txt to use a local copy."
+      exit 1
+    fi
     LISTING="$THREEAM_DIR/files.txt"
   fi
 fi
