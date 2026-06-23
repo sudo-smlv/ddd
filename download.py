@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import collections
 import itertools
+import json
 import re
 import sys
 import threading
@@ -374,18 +375,27 @@ def download_one(
     url: str,
     dest: Path,
     *,
+    rel: str,
     stats: Stats,
+    history: History,
     retries: int = 3,
     timeout: int = 300,
+    retry_all: bool = False,
 ) -> tuple[str, float, int]:
     """
     Download ``url`` to ``dest``. Returns ``(status, elapsed_seconds, bytes)``.
 
     ``status`` is one of: ``ok``, ``skip``, ``missing``, or ``error: ...``.
+
+    Skips the file (returns ``skip``) only when its prior history entry is
+    ``ok`` AND the file still exists on disk with non-zero size. Otherwise
+    (error/404/never seen) the download is attempted again.
     """
-    if dest.exists() and dest.stat().st_size > 0:
+    on_disk = dest.exists() and dest.stat().st_size > 0
+    if not retry_all and on_disk and history.is_done(rel):
         existing = dest.stat().st_size
         stats.add_bytes(existing)
+        history.record(rel, "ok", existing)  # refresh timestamp
         return "skip", 0.0, existing
 
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -402,7 +412,9 @@ def download_one(
             try:
                 with session.get(url, stream=True, timeout=timeout) as r:
                     if r.status_code == 404:
-                        return "missing", time.monotonic() - started, 0
+                        elapsed = time.monotonic() - started
+                        history.record(rel, "missing", 0)
+                        return "missing", elapsed, 0
                     r.raise_for_status()
                     with open(part, "wb") as f:
                         for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
@@ -411,7 +423,9 @@ def download_one(
                                 stats.add_bytes(len(chunk))
                                 bytes_received += len(chunk)
                 part.rename(dest)
-                return "ok", time.monotonic() - started, bytes_received
+                elapsed = time.monotonic() - started
+                history.record(rel, "ok", bytes_received)
+                return "ok", elapsed, bytes_received
             except requests.exceptions.RequestException as exc:
                 last_error = f"{type(exc).__name__}: {exc}"[:120]
             except OSError as exc:
@@ -422,7 +436,72 @@ def download_one(
 
     if part.exists():
         part.unlink()
-    return f"error: {last_error}", time.monotonic() - started, bytes_received
+    elapsed = time.monotonic() - started
+    history.record(rel, "error", bytes_received, last_error)
+    return f"error: {last_error}", elapsed, bytes_received
+
+
+# ---------------------------------------------------------------------------
+# Persistent history: skip previously-completed files, retry everything else
+# ---------------------------------------------------------------------------
+
+class History:
+    """JSON-backed per-file status log kept in the output directory.
+
+    Only files whose previous status is ``ok`` (and still present on disk)
+    are skipped on the next run. Errors and 404s are retried automatically.
+    """
+
+    FLUSH_EVERY_RECORDS = 200
+    FLUSH_EVERY_SECONDS = 15.0
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.data: dict[str, dict] = {}
+        self.pending = 0
+        self.last_flush = time.monotonic()
+        if path.exists():
+            try:
+                self.data = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                self.data = {}
+
+    def loaded_count(self) -> int:
+        return len(self.data)
+
+    def is_done(self, rel: str) -> bool:
+        return self.data.get(rel, {}).get("status") == "ok"
+
+    def record(self, rel: str, status: str, size: int = 0, error: str = "") -> None:
+        with self.lock:
+            self.data[rel] = {
+                "status": status,
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "size": size,
+                "error": error[:200] if error else "",
+            }
+            self.pending += 1
+            if (self.pending >= self.FLUSH_EVERY_RECORDS or
+                    time.monotonic() - self.last_flush >= self.FLUSH_EVERY_SECONDS):
+                self._flush_locked()
+
+    def flush(self) -> None:
+        with self.lock:
+            self._flush_locked()
+
+    def _flush_locked(self) -> None:
+        if not self.data and not self.pending:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            tmp.write_text(json.dumps(self.data, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self.path)
+            self.pending = 0
+            self.last_flush = time.monotonic()
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +567,10 @@ def main() -> int:
     ap.add_argument("--timeout", type=int, default=300)
     ap.add_argument("--no-progress", action="store_true",
                     help="Disable the live status line (also auto-disabled when stderr is not a TTY)")
+    ap.add_argument("--retry-all", action="store_true",
+                    help="Ignore history: re-download every file even if previously OK")
+    ap.add_argument("--no-history", action="store_true",
+                    help="Don't persist or load .history.json (always retry everything except on-disk files)")
     args = ap.parse_args()
 
     if not args.list.exists():
@@ -528,6 +611,16 @@ def main() -> int:
 
     stats = Stats(total_bytes=total_bytes, total_files=total_files)
 
+    history_path = args.out / ".history.json"
+    history = History(history_path)
+    if args.no_history:
+        history.path.unlink(missing_ok=True)
+        history.data.clear()
+    loaded = history.loaded_count()
+    print(f"  history     : {grey(str(history_path))}  ({loaded:,} prior records)" if loaded else
+          f"  history     : {grey(str(history_path))}  (new)", flush=True)
+    print(flush=True)
+
     reporter = Reporter(stats)
     if not args.no_progress:
         reporter.start()
@@ -539,7 +632,9 @@ def main() -> int:
         dest = args.out / rel.replace("\\", "/")
         status, elapsed, received = download_one(
             session, build_url(rel), dest,
-            stats=stats, retries=args.retries, timeout=args.timeout,
+            rel=rel, stats=stats, history=history,
+            retries=args.retries, timeout=args.timeout,
+            retry_all=args.retry_all,
         )
         return rel, size, elapsed, status, received
 
@@ -589,6 +684,8 @@ def main() -> int:
         if reporter._stderr_tty:
             sys.stderr.write("\n")
             sys.stderr.flush()
+        if not args.no_history:
+            history.flush()
 
     elapsed_total = time.monotonic() - stats.start
     finished_wall = datetime.now()
@@ -616,6 +713,8 @@ def main() -> int:
     label_w = max(len(k) for k, _ in metric_rows)
     for k, v in metric_rows:
         print(f"  {grey((k + ':')).ljust(label_w + 1)} {v}")
+    if not args.no_history:
+        print(f"  {grey('History'):<{label_w + 1}} {grey(str(history.path))}  ({len(history.data):,} records)")
     print(cyan("─" * w))
     return 0 if counts["error"] == 0 else 2
 
