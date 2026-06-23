@@ -133,14 +133,17 @@ if [[ -z "$LISTING" ]]; then
 fi
 
 OS="$(uname -s)"
+# Skip sudo when already root (containers, CI, etc.) or when sudo is missing.
+SUDO=""
+if [[ $EUID -ne 0 ]] && have sudo; then SUDO="sudo"; fi
 case "$OS" in
   Darwin) PKG_INSTALL="brew install" ;;
   Linux)
-    if have apt-get;     then PKG_INSTALL="sudo apt-get update >/dev/null && sudo apt-get install -y"
-    elif have dnf;       then PKG_INSTALL="sudo dnf install -y"
-    elif have pacman;    then PKG_INSTALL="sudo pacman -S --noconfirm"
-    elif have apk;       then PKG_INSTALL="sudo apk add --no-cache"
-    elif have zypper;    then PKG_INSTALL="sudo zypper install -y"
+    if have apt-get;     then PKG_INSTALL="$SUDO apt-get update >/dev/null && $SUDO apt-get install -y"
+    elif have dnf;       then PKG_INSTALL="$SUDO dnf install -y"
+    elif have pacman;    then PKG_INSTALL="$SUDO pacman -S --noconfirm"
+    elif have apk;       then PKG_INSTALL="$SUDO apk add --no-cache"
+    elif have zypper;    then PKG_INSTALL="$SUDO zypper install -y"
     else err "no supported package manager found (need apt/dnf/pacman/apk/zypper)"; exit 1
     fi
     ;;
