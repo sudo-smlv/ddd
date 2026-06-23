@@ -361,12 +361,23 @@ chmod +x "$THREEAM_DIR/download.py"
 # Refresh files.txt only if missing locally (avoid re-downloading 24 MB on every run)
 if [[ ! -f "$THREEAM_DIR/files.txt" ]]; then
   log "files.txt not present, fetching..."
-  curl -fsSL "$REPO_RAW/files.txt" -o "$THREEAM_DIR/files.txt"
+  if ! curl -fsSL "$REPO_RAW/files.txt" -o "$THREEAM_DIR/files.txt"; then
+    err "Failed to fetch files.txt from $REPO_RAW/files.txt"
+    err "Re-run when the network is up, or supply your own with --files PATH."
+    exit 1
+  fi
 fi
 
 # --------------------------------------------------------------------------
 # 7. Download
 # --------------------------------------------------------------------------
+# Resolve LISTING: explicit --files wins; else prefer ./files.txt in cwd;
+# else fall back to the one we just (re)fetched in $THREEAM_DIR.
+if [[ -z "${LISTING:-}" ]]; then
+  if   [[ -f "./files.txt" ]];            then LISTING="./files.txt"
+  elif [[ -f "$THREEAM_DIR/files.txt" ]]; then LISTING="$THREEAM_DIR/files.txt"
+  fi
+fi
 if [[ -z "$LISTING" || ! -f "$LISTING" ]]; then
   err "Listing not found. Pass --files /path/to/files.txt or place files.txt next to where you invoked curl."
   err "Current directory: $(pwd)"
