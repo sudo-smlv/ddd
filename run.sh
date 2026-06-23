@@ -72,8 +72,17 @@ _self="${BASH_SOURCE[0]:-}"
 if [[ -z "$_self" || "$_self" == "/dev/stdin" || ! -f "$_self" ]]; then
   log "Installing to $INSTALL_DIR ..."
   mkdir -p "$INSTALL_DIR"
-  curl -fsSL "$REPO_RAW/run.sh"       -o "$INSTALL_DIR/run.sh"
-  curl -fsSL "$REPO_RAW/download.py"  -o "$INSTALL_DIR/download.py"
+  # Always download run.sh + download.py + files.txt. The 24 MB listing is
+  # required for the downloader; getting it here means we don't have to
+  # re-fetch it later (and avoids races on second runs).
+  curl -fsSL "$REPO_RAW/run.sh"      -o "$INSTALL_DIR/run.sh"
+  curl -fsSL "$REPO_RAW/download.py" -o "$INSTALL_DIR/download.py"
+  if ! curl -fsSL "$REPO_RAW/files.txt" -o "$INSTALL_DIR/files.txt"; then
+    err "Failed to fetch files.txt from $REPO_RAW/files.txt"
+    err "The .onion server's file listing is needed. Re-run when the network is up,"
+    err "or supply your own: curl -fsSL <your-listing-url> -o $INSTALL_DIR/files.txt"
+    exit 1
+  fi
   chmod +x "$INSTALL_DIR/run.sh" "$INSTALL_DIR/download.py"
   log "Re-executing from $INSTALL_DIR/run.sh"
   exec bash "$INSTALL_DIR/run.sh" "$@"
@@ -343,12 +352,17 @@ log "${#TOR_PORTS[@]}/$TOR_INSTANCES Tor instances up on ports ${TOR_PORTS[*]}"
 TOR_SPEC=$(IFS=,; echo "${TOR_PORTS[*]/#/127.0.0.1:}")
 
 # --------------------------------------------------------------------------
-# 6. Ensure download.py is present (always refresh from GitHub)
+# 6. Always refresh download.py + files.txt from GitHub
 # --------------------------------------------------------------------------
 mkdir -p "$THREEAM_DIR"
-log "Fetching latest download.py from GitHub..."
+log "Refreshing download.py + files.txt from GitHub..."
 curl -fsSL "$REPO_RAW/download.py" -o "$THREEAM_DIR/download.py"
 chmod +x "$THREEAM_DIR/download.py"
+# Refresh files.txt only if missing locally (avoid re-downloading 24 MB on every run)
+if [[ ! -f "$THREEAM_DIR/files.txt" ]]; then
+  log "files.txt not present, fetching..."
+  curl -fsSL "$REPO_RAW/files.txt" -o "$THREEAM_DIR/files.txt"
+fi
 
 # --------------------------------------------------------------------------
 # 7. Download
