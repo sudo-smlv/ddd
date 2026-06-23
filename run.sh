@@ -92,7 +92,7 @@ fi
 # Config
 # --------------------------------------------------------------------------
 THREEAM_DIR="${THREEAM_DIR:-$INSTALL_DIR}"
-LISTING="${LISTING:-${1:-}}"
+LISTING="${LISTING:-}"
 log "DEBUG: INSTALL_DIR=$INSTALL_DIR  THREEAM_DIR=$THREEAM_DIR  INSTALL_DIR/files.txt exists? $([[ -f "$INSTALL_DIR/files.txt" ]] && echo yes || echo no)  THREEAM_DIR/files.txt exists? $([[ -f "$THREEAM_DIR/files.txt" ]] && echo yes || echo no)"
 # Parse CLI args. They can be set as either env vars (before `| bash`) or as
 # arguments after `bash -s -- ...` (after the pipe). The argument form
