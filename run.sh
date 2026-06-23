@@ -30,23 +30,37 @@
 set -euo pipefail
 
 # --------------------------------------------------------------------------
+# Helpers (defined up here so the stdin-bootstrap and listing fetch below can use them)
+# --------------------------------------------------------------------------
+log()      { printf '\033[1;34m[setup]\033[0m %s\n' "$*"; }
+err()      { printf '\033[1;31m[err ]\033[0m %s\n' "$*" >&2; }
+have()     { command -v "$1" >/dev/null 2>&1; }
+
+# --------------------------------------------------------------------------
 # Where to install when invoked via `curl | bash`
+# Default: a `threeam/` subdirectory of the directory the user is in.
 # --------------------------------------------------------------------------
 REPO_RAW="https://raw.githubusercontent.com/sudo-smlv/ddd/main"
-INSTALL_DIR="${INSTALL_DIR:-$HOME/.threeam}"
+: "${INSTALL_DIR:=}"
+if [[ -z "$INSTALL_DIR" ]]; then
+  if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "/dev/stdin" && -f "${BASH_SOURCE[0]}" ]]; then
+    INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  else
+    INSTALL_DIR="$PWD/threeam"
+  fi
+fi
 
 # --------------------------------------------------------------------------
 # If we were piped from stdin, materialise ourselves to disk first
 # --------------------------------------------------------------------------
 _self="${BASH_SOURCE[0]:-}"
 if [[ -z "$_self" || "$_self" == "/dev/stdin" || ! -f "$_self" ]]; then
-  log_step() { printf '\033[1;34m[setup]\033[0m %s\n' "$*"; }
-  log_step "Installing to $INSTALL_DIR ..."
+  log "Installing to $INSTALL_DIR ..."
   mkdir -p "$INSTALL_DIR"
   curl -fsSL "$REPO_RAW/run.sh"       -o "$INSTALL_DIR/run.sh"
   curl -fsSL "$REPO_RAW/download.py"  -o "$INSTALL_DIR/download.py"
   chmod +x "$INSTALL_DIR/run.sh" "$INSTALL_DIR/download.py"
-  log_step "Re-executing from $INSTALL_DIR/run.sh"
+  log "Re-executing from $INSTALL_DIR/run.sh"
   exec bash "$INSTALL_DIR/run.sh" "$@"
 fi
 
@@ -102,13 +116,6 @@ if [[ -z "$LISTING" ]]; then
     LISTING="$THREEAM_DIR/files.txt"
   fi
 fi
-
-# --------------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------------
-log()      { printf '\033[1;34m[setup]\033[0m %s\n' "$*"; }
-err()      { printf '\033[1;31m[err ]\033[0m %s\n' "$*" >&2; }
-have()     { command -v "$1" >/dev/null 2>&1; }
 
 OS="$(uname -s)"
 case "$OS" in
