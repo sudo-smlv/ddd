@@ -703,16 +703,19 @@ class Reporter(threading.Thread):
         self.console = console
         self.interval = interval
         self.milestone_interval = milestone_interval
-        self._stop = threading.Event()
+        # NB: must NOT be named self._stop — threading.Thread already defines a
+        # private _stop() method, and shadowing it with an Event makes
+        # Thread.join() crash with "'Event' object is not callable".
+        self._stop_event = threading.Event()
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
 
     def run(self) -> None:
         next_milestone = 3.0
         next_sample = 3.0
         try:
-            while not self._stop.wait(self.interval):
+            while not self._stop_event.wait(self.interval):
                 elapsed = time.monotonic() - self.stats.start
                 if elapsed >= next_sample:
                     self.stats.record_checkpoint_speed()
@@ -776,6 +779,16 @@ def main() -> int:
         return 1
 
     files = list(parse_listing(args.list))
+    if not files:
+        size = args.list.stat().st_size if args.list.exists() else 0
+        print(f"{red('error')}: parsed 0 files from {args.list} ({size:,} bytes).",
+              file=sys.stderr)
+        print("  The listing looks empty or isn't a Windows `dir /s` output.",
+              file=sys.stderr)
+        print("  If you fetched it from the .onion, make sure the URL ends with "
+              "`?sub=files.txt` — without it the server returns an empty page.",
+              file=sys.stderr)
+        return 1
     if args.filter:
         needle = args.filter.lower()
         files = [(p, s) for p, s in files if needle in p.lower()]

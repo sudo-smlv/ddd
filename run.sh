@@ -468,6 +468,17 @@ fi
 
 if [[ -f "$LISTING" ]]; then
   size=$(stat -c%s "$LISTING" 2>/dev/null || stat -f%z "$LISTING" 2>/dev/null || echo 0)
+  # A fetched-but-tiny listing means the server returned an empty/error page —
+  # most commonly because the .onion URL was missing the `?sub=files.txt`
+  # query. curl reports success for an empty 200, so guard on size here.
+  if [[ "$size" -lt 1024 ]]; then
+    fail "Listing is only ${size} bytes — looks empty."
+    if [[ -n "${LISTING_URL:-}" && "$LISTING_URL" != *"sub="* ]]; then
+      err "The URL has no \033[1m?sub=files.txt\033[0m — without it the server returns an empty page."
+      err "Try: \033[1m${LISTING_URL}?sub=files.txt\033[0m"
+    fi
+    exit 1
+  fi
   ok "Listing ready: \033[1m$LISTING\033[0m \033[2m($((size / 1024 / 1024)) MiB)\033[0m"
 else
   fail "Listing not found. Pass --files PATH or --url URL."
