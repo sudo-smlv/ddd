@@ -431,14 +431,26 @@ curl -fsSL "$REPO_RAW/download.py" -o "$THREEAM_DIR/download.py"
 chmod +x "$THREEAM_DIR/download.py"
 
 if [[ -n "${LISTING_URL:-}" && "$LISTING_URL" =~ \.onion ]]; then
-  if curl --max-time 180 --socks5-hostname 127.0.0.1:"${TOR_PORTS[0]}" -fsSL "$LISTING_URL" -o "$LISTING"; then
-    ok "Fetched listing from \033[1;35m$LISTING_URL\033[0m via Tor"
-  else
-    fail "Could not fetch $LISTING_URL through Tor"
-    exit 1
-  fi
+  # 24 MB through .onion over Tor can take 5+ minutes. Retry with resume.
+  attempt=0
+  while [[ $attempt -lt 5 ]]; do
+    attempt=$((attempt + 1))
+    wait "Fetching listing from .onion via Tor (attempt $attempt/5, resumable)..."
+    if curl --max-time 600 --retry 0 --speed-time 30 --speed-limit 1024 \
+         -C - --socks5-hostname 127.0.0.1:"${TOR_PORTS[0]}" \
+         -fsSL "$LISTING_URL" -o "$LISTING"; then
+      ok "Fetched listing from \033[1;35m$LISTING_URL\033[0m via Tor"
+      break
+    fi
+    if [[ $attempt -eq 5 ]]; then
+      fail "Could not fetch $LISTING_URL through Tor after 5 attempts"
+      exit 1
+    fi
+    wait "  Partial fetch, retrying in 5s..."
+    sleep 5
+  done
 elif [[ -n "${LISTING_URL:-}" ]]; then
-  if curl --max-time 180 -fsSL "$LISTING_URL" -o "$LISTING"; then
+  if curl --max-time 600 -C - -fsSL "$LISTING_URL" -o "$LISTING"; then
     ok "Fetched listing from \033[1m$LISTING_URL\033[0m"
   else
     fail "Could not fetch $LISTING_URL"
