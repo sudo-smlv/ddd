@@ -91,6 +91,17 @@ def grey(text: str)   -> str: return _ansi("90", text)
 def cyan(text: str)   -> str: return _ansi("36", text)
 def bold(text: str)   -> str: return _ansi("1", text)
 
+_RE_ANSI = re.compile(r"\033\[[0-9;]*m")
+
+
+def strip_ansi(text: str) -> str:
+    return _RE_ANSI.sub("", text)
+
+
+def vlen(text: str) -> int:
+    """Visible width: ignore ANSI colour codes when measuring for padding."""
+    return len(strip_ansi(text))
+
 # ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
@@ -199,14 +210,16 @@ class Stats:
         self.completed_files = 0
         self.active_files = 0
         self.error_files = 0
+        self.ok_files = 0
         self.downloaded = 0
         self.lock = threading.Lock()
         self.window: collections.deque[tuple[float, int]] = collections.deque()
         self.speed_history: collections.deque[float] = collections.deque(maxlen=60)
         self.start = time.monotonic()
-        self._last_status_len = 0
+        # rel -> [received_bytes, total_size, started_monotonic]
+        self.active_map: dict[str, list] = {}
 
-    def add_bytes(self, n: int) -> None:
+    def add_bytes(self, n: int, rel: str | None = None) -> None:
         now = time.monotonic()
         with self.lock:
             self.downloaded += n
@@ -214,17 +227,25 @@ class Stats:
             cutoff = now - SPEED_WINDOW_SEC
             while self.window and self.window[0][0] < cutoff:
                 self.window.popleft()
+            if rel is not None:
+                entry = self.active_map.get(rel)
+                if entry is not None:
+                    entry[0] += n
 
-    def file_started(self) -> None:
+    def file_started(self, rel: str, size: int) -> None:
         with self.lock:
             self.active_files += 1
+            self.active_map[rel] = [0, size, time.monotonic()]
 
-    def file_finished(self, *, error: bool) -> None:
+    def file_finished(self, rel: str, *, error: bool) -> None:
         with self.lock:
             self.active_files = max(0, self.active_files - 1)
             self.completed_files += 1
             if error:
                 self.error_files += 1
+            else:
+                self.ok_files += 1
+            self.active_map.pop(rel, None)
 
     @property
     def rolling_speed(self) -> float:
@@ -271,8 +292,30 @@ class Stats:
             f"elapsed {fmt_duration(elapsed)}"
         )
 
-    def render_milestone(self) -> str:
-        """Boxed multi-line checkpoint written to stdout."""
+    def _active_rows(self, limit: int = 6) -> list[str]:
+        """Compact one-line-per-file view of in-flight downloads (oldest first).
+
+        Each returned string has visible width <= 66 so it fits the 72-wide box.
+        """
+        now = time.monotonic()
+        with self.lock:
+            items = sorted(self.active_map.items(), key=lambda kv: kv[1][2])
+            snap = [(rel, recv, size, now - t0) for rel, (recv, size, t0) in items]
+        rows: list[str] = []
+        for rel, recv, size, age in snap[:limit]:
+            name = rel.replace("\\", "/").rsplit("/", 1)[-1]
+            if len(name) > 30:
+                name = name[:29] + "…"
+            pdone = (100.0 * recv / size) if size else 0.0
+            sizes = f"{fmt_bytes(recv).strip():>10} / {fmt_bytes(size).strip():<10}"
+            rows.append(f"{name:<30} {grey(sizes)} {pdone:5.1f}%")
+        extra = len(snap) - len(rows)
+        if extra > 0:
+            rows.append(grey(f"+{extra} more downloading…"))
+        return rows
+
+    def render_panel(self) -> str:
+        """Boxed multi-line live panel (also used for non-TTY checkpoints)."""
         elapsed = time.monotonic() - self.start
         pct = 100.0 * self.downloaded / self.total_bytes if self.total_bytes else 0.0
         speed = self.lifetime_speed
@@ -283,6 +326,7 @@ class Stats:
             active = self.active_files
             done = self.completed_files
             errors = self.error_files
+            ok = self.ok_files
         clock_now = datetime.now().strftime("%H:%M:%S")
         bar = render_bar(pct, width=44)
         sparkline = self._sparkline()
@@ -291,32 +335,39 @@ class Stats:
         sep    = cyan("╟" + "─" * (W - 2) + "╢")
         bottom = cyan("╚" + "═" * (W - 2) + "╝")
 
-        def row(k: str, v: str) -> str:
-            content = f" {bold(k):<12} {v}"
-            pad = max(1, W - 2 - len(content))
+        def line(content: str) -> str:
+            pad = max(1, W - 2 - vlen(content))
             return cyan("║") + content + (" " * pad) + cyan("║")
 
-        def plain(content: str) -> str:
-            pad = max(1, W - 2 - len(content))
-            return cyan("║") + content + (" " * pad) + cyan("║")
+        def row(k: str, v: str) -> str:
+            return line(f" {bold(k)}{' ' * max(1, 12 - vlen(k))}{v}")
 
         lines = [
-            "",
             top,
-            plain(f"{bold('checkpoint')}  {grey(clock_now)}"),
+            line(f" {bold('threeam downloader')}    {grey(clock_now)}"),
             sep,
-            plain(f"{bar}  {pct:6.2f}%"),
+            line(f" {bar}  {pct:6.2f}%"),
             sep,
-            row("Files",      f"{done:,} / {self.total_files:,}   ({active} active, {errors} errors)"),
+            row("Files",      f"{done:,} / {self.total_files:,}   "
+                              f"({green(str(ok) + ' ok')}, {red(str(errors) + ' err')}, {active} active)"),
             row("Downloaded", f"{fmt_gib(self.downloaded).strip()} / {fmt_gib(self.total_bytes).strip()}   "
                                f"({fmt_gib(remaining).strip()} left)"),
             row("Speed",      f"{fmt_speed(rolling)} rolling (60s)   {fmt_speed(speed)} avg"),
             row("History",    sparkline),
-            row("Elapsed",    fmt_duration(elapsed)),
-            row("ETA",        f"{fmt_duration(eta)}   finish {fmt_clock(eta)}"),
-            bottom,
+            row("Elapsed",    f"{fmt_duration(elapsed)}   ETA {fmt_duration(eta)}   finish {fmt_clock(eta)}"),
         ]
+        active_rows = self._active_rows()
+        if active_rows:
+            lines.append(sep)
+            lines.append(line(f" {bold('downloading now')}"))
+            for info in active_rows:
+                lines.append(line(f"   {grey('•')} {info}"))
+        lines.append(bottom)
         return "\n".join(lines)
+
+    # Back-compat alias (non-TTY checkpoint path).
+    def render_milestone(self) -> str:
+        return "\n" + self.render_panel()
 
     def _sparkline(self) -> str:
         """Render last 30 speed samples as unicode sparkline."""
@@ -336,6 +387,91 @@ class Stats:
         speed = self.rolling_speed or self.lifetime_speed
         with self.lock:
             self.speed_history.append(speed)
+
+
+# ---------------------------------------------------------------------------
+# Console: owns the screen so the live panel and scrolling log never collide
+# ---------------------------------------------------------------------------
+
+class Console:
+    """Single writer for stdout.
+
+    On a TTY it keeps a multi-line status panel pinned at the bottom and
+    redraws it *in place* (no duplicate boxes). Scrolling lines (per-file
+    results) are printed above the panel: erase panel → print line → redraw.
+
+    When stdout is not a TTY (piped/redirected) it falls back to plain
+    scrolling output with an occasional checkpoint box. A separate plain-text
+    log file (``--log``) always receives un-coloured lines.
+    """
+
+    def __init__(self, stats: Stats, logfile=None):
+        self.stats = stats
+        self.lock = threading.RLock()
+        self.tty = sys.stdout.isatty()
+        self.logfile = logfile
+        self.panel_height = 0  # lines currently occupied by the pinned panel
+
+    # -- internal (call with lock held) --------------------------------------
+    def _erase_panel(self) -> None:
+        if self.panel_height:
+            sys.stdout.write(f"\033[{self.panel_height}A\033[J")
+            self.panel_height = 0
+
+    def _draw_panel(self) -> None:
+        text = self.stats.render_panel()
+        sys.stdout.write(text + "\n")
+        self.panel_height = text.count("\n") + 1
+        sys.stdout.flush()
+
+    def _to_logfile(self, line: str) -> None:
+        if self.logfile:
+            try:
+                self.logfile.write(strip_ansi(line) + "\n")
+                self.logfile.flush()
+            except (OSError, ValueError):
+                pass
+
+    # -- public --------------------------------------------------------------
+    def log(self, line: str) -> None:
+        """Emit a scrolling line above the live panel."""
+        with self.lock:
+            if self.tty:
+                self._erase_panel()
+                sys.stdout.write(line + "\n")
+                self._draw_panel()
+            else:
+                sys.stdout.write(line + "\n")
+                sys.stdout.flush()
+            self._to_logfile(line)
+
+    def refresh(self) -> None:
+        """Redraw the live panel in place (TTY only)."""
+        if not self.tty:
+            return
+        with self.lock:
+            self._erase_panel()
+            self._draw_panel()
+
+    def checkpoint_box(self) -> None:
+        """Non-TTY periodic checkpoint: append a box to stdout + logfile."""
+        box = self.stats.render_panel()
+        if not self.tty:
+            sys.stdout.write("\n" + box + "\n")
+            sys.stdout.flush()
+        self._to_logfile(strip_ansi(box))
+
+    def print_banner(self, text: str) -> None:
+        with self.lock:
+            sys.stdout.write(text + "\n")
+            sys.stdout.flush()
+            self._to_logfile(text)
+
+    def close(self) -> None:
+        with self.lock:
+            if self.tty:
+                self._erase_panel()
+                self._draw_panel()  # leave a final, complete panel on screen
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +526,7 @@ def download_one(
     dest: Path,
     *,
     rel: str,
+    size: int,
     stats: Stats,
     history: History,
     retries: int = 3,
@@ -419,7 +556,7 @@ def download_one(
     if part.exists():
         part.unlink()
 
-    stats.file_started()
+    stats.file_started(rel, size)
     started = time.monotonic()
     last_error = ""
     bytes_received = 0
@@ -456,7 +593,7 @@ def download_one(
                         for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
                             if chunk:
                                 f.write(chunk)
-                                stats.add_bytes(len(chunk))
+                                stats.add_bytes(len(chunk), rel)
                                 bytes_received += len(chunk)
                 part.rename(dest)
                 elapsed = time.monotonic() - started
@@ -471,7 +608,7 @@ def download_one(
                 break
             time.sleep(min(2 ** net_attempt, 30))
     finally:
-        stats.file_finished(error=not last_error == "" and bytes_received == 0)
+        stats.file_finished(rel, error=last_error != "" and bytes_received == 0)
 
     if part.exists():
         part.unlink()
@@ -548,54 +685,47 @@ class History:
 # ---------------------------------------------------------------------------
 
 class Reporter(threading.Thread):
-    """Two outputs:
+    """Drives the live display through the Console.
 
-    * Every STATUS_INTERVAL_SEC: rewrite a one-line status on stderr (if TTY).
-    * Every MILESTONE_INTERVAL_SEC: append a multi-line checkpoint to stdout
-      so it shows up in `tee`'d log files even when stderr isn't a terminal.
+    * TTY: redraw the pinned panel in place every ``interval`` seconds.
+    * non-TTY: append a checkpoint box every ``milestone_interval`` seconds.
     """
 
     def __init__(
         self,
         stats: Stats,
+        console: Console,
         interval: float = STATUS_INTERVAL_SEC,
         milestone_interval: float = MILESTONE_INTERVAL_SEC,
     ):
         super().__init__(daemon=True, name="status-reporter")
         self.stats = stats
+        self.console = console
         self.interval = interval
         self.milestone_interval = milestone_interval
         self._stop = threading.Event()
-        self._stderr_tty = sys.stderr.isatty()
-        self._last_milestone = 0.0
 
     def stop(self) -> None:
         self._stop.set()
 
     def run(self) -> None:
         next_milestone = 3.0
+        next_sample = 3.0
         try:
             while not self._stop.wait(self.interval):
                 elapsed = time.monotonic() - self.stats.start
-                if elapsed >= next_milestone:
-                    try:
-                        self.stats.record_checkpoint_speed()
-                        msg = self.stats.render_milestone()
-                        sys.stdout.write("\n" + msg + "\n")
-                        sys.stdout.flush()
+                if elapsed >= next_sample:
+                    self.stats.record_checkpoint_speed()
+                    next_sample = elapsed + self.milestone_interval
+                try:
+                    if self.console.tty:
+                        self.console.refresh()
+                    elif elapsed >= next_milestone:
+                        self.console.checkpoint_box()
                         next_milestone = elapsed + self.milestone_interval
-                    except Exception as e:
-                        sys.stderr.write(f"[reporter] checkpoint error: {e}\n")
-                        sys.stderr.flush()
-                        next_milestone = elapsed + self.milestone_interval
-                if self._stderr_tty:
-                    try:
-                        line = self.stats.render_status_line()
-                        sys.stderr.write("\r" + line + "\033[K")
-                        sys.stderr.flush()
-                    except Exception as e:
-                        sys.stderr.write(f"[reporter] status error: {e}\n")
-                        sys.stderr.flush()
+                except Exception as e:
+                    sys.stderr.write(f"[reporter] error: {e}\n")
+                    sys.stderr.flush()
         except Exception as e:
             sys.stderr.write(f"[reporter] fatal: {e}\n")
             sys.stderr.flush()
@@ -636,6 +766,9 @@ def main() -> int:
                          "or 'errors' (errors only). Default: sampled.")
     ap.add_argument("--file-sample", type=int, default=50,
                     help="When --show-files=sampled, print one per-file line every N completions. Default: 50")
+    ap.add_argument("--log", default="", type=str,
+                    help="Append a plain-text (un-coloured) copy of all output to this file. "
+                         "Lets the live panel own the terminal instead of being piped through tee.")
     args = ap.parse_args()
 
     if not args.list.exists():
@@ -655,26 +788,33 @@ def main() -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     proxies = parse_proxies(args.tor or None)
 
+    stats = Stats(total_bytes=total_bytes, total_files=total_files)
+
+    logfile = None
+    if args.log:
+        try:
+            logfile = open(args.log, "a", encoding="utf-8")
+        except OSError as exc:
+            print(f"warning: cannot open --log {args.log}: {exc}", file=sys.stderr)
+    console = Console(stats, logfile=logfile)
+
     banner = (
         f"{cyan('╔══════════════════════════════════════════════════════════════════╗')}\n"
         f"{cyan('║')}                  {bold('threeam downloader')}                                {cyan('║')}\n"
         f"{cyan('╚══════════════════════════════════════════════════════════════════╝')}"
     )
-    print(banner, flush=True)
+    console.print_banner(banner)
     info_lines = [
         ("Files",       f"{total_files:,}"),
         ("Total size",  fmt_gib(total_bytes).strip()),
-        ("Output",      args.out),
+        ("Output",      str(args.out)),
         ("Workers",     str(args.workers)),
         ("Tor proxies", f"{len(proxies)} ({', '.join(p.split('://')[-1] for p in proxies if p) or 'direct'})"),
         ("Started",     started_wall.strftime("%Y-%m-%d %H:%M:%S")),
     ]
     label_w = max(len(k) for k, _ in info_lines)
     for k, v in info_lines:
-        print(f"  {grey(k + ':').ljust(label_w + 1)} {v}", flush=True)
-    print(flush=True)
-
-    stats = Stats(total_bytes=total_bytes, total_files=total_files)
+        console.print_banner(f"  {grey(k + ':').ljust(label_w + 1)} {v}")
 
     history_path = args.out / ".history.json"
     history = History(history_path)
@@ -682,16 +822,14 @@ def main() -> int:
         history.path.unlink(missing_ok=True)
         history.data.clear()
     loaded = history.loaded_count()
-    print(f"  history     : {grey(str(history_path))}  ({loaded:,} prior records)" if loaded else
-          f"  history     : {grey(str(history_path))}  (new)", flush=True)
-    print(flush=True)
-    print(f"{cyan('▶')} Starting {args.workers} workers across {len(proxies)} Tor instance(s)...", flush=True)
-    print(f"{grey(f'  checkpoints every 10s. Per-file lines for errors, files >= 1 MiB, and every {args.file_sample}th completion.')}",
-          flush=True)
-    print(f"{grey('  Press Ctrl-C to pause; re-run to resume.')}", flush=True)
-    print(flush=True)
+    console.print_banner(
+        f"  history     : {grey(str(history_path))}  ({loaded:,} prior records)" if loaded else
+        f"  history     : {grey(str(history_path))}  (new)")
+    console.print_banner(
+        f"{cyan('▶')} Starting {args.workers} workers across {len(proxies)} Tor instance(s)...   "
+        f"{grey('Ctrl-C to pause; re-run to resume.')}")
 
-    reporter = Reporter(stats)
+    reporter = Reporter(stats, console)
     if not args.no_progress:
         reporter.start()
 
@@ -702,7 +840,7 @@ def main() -> int:
         dest = args.out / rel.replace("\\", "/")
         status, elapsed, received = download_one(
             session, build_url(rel), dest,
-            rel=rel, stats=stats, history=history,
+            rel=rel, size=size, stats=stats, history=history,
             retries=args.retries, timeout=args.timeout,
             connect_timeout=args.connect_timeout,
             retry_all=args.retry_all,
@@ -759,28 +897,25 @@ def main() -> int:
                     or (args.show_files == "sampled" and i % args.file_sample == 0)
                 )
                 if print_line:
-                    print(
+                    console.log(
                         f"  {icon} [{i:>6}/{total_files}]  {tag}  "
-                        f"{size:>12,}  {timing}   {rel_display}",
-                        flush=True,
-                    )
+                        f"{size:>12,}  {timing}   {rel_display}")
     finally:
         reporter.stop()
         if reporter.is_alive():
             reporter.join(timeout=2)
-        if reporter._stderr_tty:
-            sys.stderr.write("\n")
-            sys.stderr.flush()
+        console.close()
         if not args.no_history:
             history.flush()
 
     elapsed_total = time.monotonic() - stats.start
     finished_wall = datetime.now()
-    print()
     w = 70
-    print(cyan("═" * w))
-    print(cyan("║") + bold("{:^68}".format("COMPLETED" if counts["error"] == 0 else "FINISHED WITH ERRORS")).center(68) + cyan("║"))
-    print(cyan("═" * w))
+    out = console.print_banner
+    out("")
+    out(cyan("═" * w))
+    out(cyan("  ") + bold("COMPLETED" if counts["error"] == 0 else "FINISHED WITH ERRORS"))
+    out(cyan("═" * w))
     summary_rows = [
         (green("✓ ok"),      counts["ok"]),
         (grey("⊘ skipped"), counts["skip"]),
@@ -788,8 +923,8 @@ def main() -> int:
         (red("✗ errors"),  counts["error"]),
     ]
     for label, count in summary_rows:
-        print(f"  {label:<14}  {count:>9,}")
-    print()
+        out(f"  {label:<14}  {count:>9,}")
+    out("")
     metric_rows = [
         ("Total",        fmt_gib(stats.downloaded).strip()),
         ("Avg speed",    f"{fmt_speed(stats.lifetime_speed)}"),
@@ -799,10 +934,12 @@ def main() -> int:
     ]
     label_w = max(len(k) for k, _ in metric_rows)
     for k, v in metric_rows:
-        print(f"  {grey((k + ':')).ljust(label_w + 1)} {v}")
+        out(f"  {grey((k + ':')).ljust(label_w + 1)} {v}")
     if not args.no_history:
-        print(f"  {grey('History'):<{label_w + 1}} {grey(str(history.path))}  ({len(history.data):,} records)")
-    print(cyan("─" * w))
+        out(f"  {grey('History:').ljust(label_w + 1)} {grey(str(history.path))}  ({len(history.data):,} records)")
+    out(cyan("─" * w))
+    if logfile:
+        logfile.close()
     return 0 if counts["error"] == 0 else 2
 
 

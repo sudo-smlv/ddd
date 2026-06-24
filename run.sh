@@ -495,13 +495,17 @@ EXTRA_ARGS=()
 
 echo
 
+# Run attached to the terminal (no pipe) so the live panel can redraw in
+# place. The downloader writes a plain-text copy of all output to --log
+# itself, replacing the old `| tee` (which made stdout a non-TTY and forced
+# the ugly duplicated checkpoint boxes).
 $PY "$THREEAM_DIR/download.py" \
   --list  "$LISTING" \
   --out   "$OUT_DIR" \
   --tor   "$TOR_SPEC" \
   --workers "$WORKERS" \
   "${EXTRA_ARGS[@]}" \
-  2>&1 | tee -a "$LOG_DIR/download.log"
+  --log "$LOG_DIR/download.log"
 
 ok "Done. Stop all Tor instances: \033[1mpkill -f 'tor -f $TOR_DIR'\033[0m"
 ok "Re-run anytime:           \033[1m$INSTALL_DIR/run.sh\033[0m"
