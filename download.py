@@ -211,7 +211,9 @@ class Stats:
         self.active_files = 0
         self.error_files = 0
         self.ok_files = 0
-        self.downloaded = 0
+        self.skipped_files = 0
+        self.downloaded = 0       # progress bytes (incl. already-on-disk skips)
+        self.net_downloaded = 0   # bytes actually pulled over the network this run
         self.lock = threading.Lock()
         self.window: collections.deque[tuple[float, int]] = collections.deque()
         self.speed_history: collections.deque[float] = collections.deque(maxlen=60)
@@ -221,9 +223,11 @@ class Stats:
         self.controls = None  # set to a Controls instance for the live row
 
     def add_bytes(self, n: int, rel: str | None = None) -> None:
+        """Real network bytes: count toward progress, speed window, and net."""
         now = time.monotonic()
         with self.lock:
             self.downloaded += n
+            self.net_downloaded += n
             self.window.append((now, n))
             cutoff = now - SPEED_WINDOW_SEC
             while self.window and self.window[0][0] < cutoff:
@@ -248,6 +252,13 @@ class Stats:
                 self.ok_files += 1
             self.active_map.pop(rel, None)
 
+    def file_skipped(self, n: int) -> None:
+        """Already-on-disk file: advance progress only — not speed, not net."""
+        with self.lock:
+            self.completed_files += 1
+            self.skipped_files += 1
+            self.downloaded += n
+
     @property
     def rolling_speed(self) -> float:
         with self.lock:
@@ -261,9 +272,11 @@ class Stats:
 
     @property
     def lifetime_speed(self) -> float:
+        # Only count bytes actually pulled over the network — skipped files that
+        # were already on disk must not inflate the average speed.
         elapsed = time.monotonic() - self.start
         with self.lock:
-            done = self.downloaded
+            done = self.net_downloaded
         return done / elapsed if elapsed > 0 else 0.0
 
     @property
@@ -328,6 +341,8 @@ class Stats:
             done = self.completed_files
             errors = self.error_files
             ok = self.ok_files
+            skipped = self.skipped_files
+            net = self.net_downloaded
         clock_now = datetime.now().strftime("%H:%M:%S")
         bar = render_bar(pct, width=44)
         sparkline = self._sparkline()
@@ -337,7 +352,10 @@ class Stats:
         bottom = cyan("╚" + "═" * (W - 2) + "╝")
 
         def line(content: str) -> str:
-            pad = max(1, W - 2 - vlen(content))
+            # Clamp to the inner width so a long row can never break the border.
+            if vlen(content) > W - 2:
+                content = strip_ansi(content)[: W - 3] + "…"
+            pad = max(0, W - 2 - vlen(content))
             return cyan("║") + content + (" " * pad) + cyan("║")
 
         def row(k: str, v: str) -> str:
@@ -350,9 +368,11 @@ class Stats:
             line(f" {bar}  {pct:6.2f}%"),
             sep,
             row("Files",      f"{done:,} / {self.total_files:,}   "
-                              f"({green(str(ok) + ' ok')}, {red(str(errors) + ' err')}, {active} active)"),
-            row("Downloaded", f"{fmt_gib(self.downloaded).strip()} / {fmt_gib(self.total_bytes).strip()}   "
+                              f"({green(str(ok) + ' new')}, {grey(str(skipped) + ' skip')}, "
+                              f"{red(str(errors) + ' err')}, {active} active)"),
+            row("Progress",   f"{fmt_gib(self.downloaded).strip()} / {fmt_gib(self.total_bytes).strip()}   "
                                f"({fmt_gib(remaining).strip()} left)"),
+            row("This run",   f"{fmt_gib(net).strip()} downloaded over network"),
             row("Speed",      f"{fmt_speed(rolling)} rolling (60s)   {fmt_speed(speed)} avg"),
             row("History",    sparkline),
             row("Elapsed",    f"{fmt_duration(elapsed)}   ETA {fmt_duration(eta)}   finish {fmt_clock(eta)}"),
@@ -710,7 +730,7 @@ def download_one(
     on_disk = dest.exists() and dest.stat().st_size > 0
     if not retry_all and on_disk and history.is_done(rel):
         existing = dest.stat().st_size
-        stats.add_bytes(existing)
+        stats.file_skipped(existing)
         history.record(rel, "ok", existing)  # refresh timestamp
         return "skip", 0.0, existing
 
@@ -1129,7 +1149,8 @@ def main() -> int:
         out(f"  {label:<14}  {count:>9,}")
     out("")
     metric_rows = [
-        ("Total",        fmt_gib(stats.downloaded).strip()),
+        ("Downloaded",   f"{fmt_gib(stats.net_downloaded).strip()} over network this run"),
+        ("On disk",      f"{fmt_gib(stats.downloaded).strip()} / {fmt_gib(stats.total_bytes).strip()} total"),
         ("Avg speed",    f"{fmt_speed(stats.lifetime_speed)}"),
         ("Wall time",    fmt_duration(elapsed_total)),
         ("Started",      started_wall.strftime("%Y-%m-%d %H:%M:%S")),
