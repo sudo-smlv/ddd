@@ -48,6 +48,7 @@ prompt() {
     answer="$default"
   fi
   if [[ -z "$answer" ]]; then answer="$default"; fi
+  printf '%s' "$answer"
   eval "$var=\"\$answer\""
 }
 
