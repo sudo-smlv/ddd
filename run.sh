@@ -38,17 +38,16 @@ prompt() {
   local text="$1" var="$2" default="${3:-}"
   local answer
   if [[ -r /dev/tty ]]; then
+    printf '\n  \033[1;36m▸\033[0m \033[1m%s\033[0m' "$text" > /dev/tty
     if [[ -n "$default" ]]; then
-      printf '\033[1;36m?\033[0m %s \033[2m[%s]\033[0m: ' "$text" "$default" > /dev/tty
-    else
-      printf '\033[1;36m?\033[0m %s: ' "$text" > /dev/tty
+      printf '  \033[2m(default: %s)\033[0m' "$default" > /dev/tty
     fi
+    printf '\n  \033[1;32m›\033[0m ' > /dev/tty
     read -r answer < /dev/tty || answer=""
   else
     answer="$default"
   fi
   if [[ -z "$answer" ]]; then answer="$default"; fi
-  printf '%s' "$answer"
   eval "$var=\"\$answer\""
 }
 
@@ -85,11 +84,8 @@ if [[ -z "$_self" || "$_self" == "/dev/stdin" || ! -f "$_self" ]]; then
   fi
   chmod +x "$INSTALL_DIR/run.sh" "$INSTALL_DIR/download.py"
 
-  cat > /dev/tty <<EOF 2>/dev/null || true
-
-\033[1;32m✓\033[0m Installed. Re-running interactively from $INSTALL_DIR/run.sh ...
-
-EOF
+  printf "\n\033[1;32m✓\033[0m Installed to \033[1;36m%s\033[0m\n" "$INSTALL_DIR" > /dev/tty 2>/dev/null || true
+  printf "\033[2m  Re-running interactively...\033[0m\n\n" > /dev/tty 2>/dev/null || true
 
   exec bash "$INSTALL_DIR/run.sh" "$@"
 fi
@@ -147,23 +143,17 @@ if [[ -r /dev/tty ]] && [[ -z "${LISTING:-}${LISTING_URL:-}" || -z "${TOR_INSTAN
 fi
 
 if $INTERACTIVE; then
-  cat > /dev/tty <<'BANNER'
-
-\033[1;36m╔══════════════════════════════════════════════════════════════════╗\033[0m
-\033[1;36m║\033[0m           \033[1;37mthreeam\033[0m — bulk \033[1;35m.onion\033[0m downloader                  \033[1;36m║\033[0m
-\033[1;36m╚══════════════════════════════════════════════════════════════════╝\033[0m
-
-BANNER
+  printf '\n\033[1;36m╔══════════════════════════════════════════════════════════════════╗\033[0m\n' > /dev/tty
+  printf '\033[1;36m║\033[0m           \033[1;37mthreeam\033[0m — bulk \033[1;35m.onion\033[0m downloader                  \033[1;36m║\033[0m\n' > /dev/tty
+  printf '\033[1;36m╚══════════════════════════════════════════════════════════════════╝\033[0m\n\n' > /dev/tty
 
   if [[ -z "${LISTING:-}" && -z "${LISTING_URL:-}" ]]; then
-    cat > /dev/tty <<'HINT'
+    printf '  Where is files.txt? You can paste:\n' > /dev/tty
+    printf '    • a \033[1;35m.onion\033[0m URL  (http://abc...onion/path/files.txt)\n' > /dev/tty
+    printf '    • a regular URL (https://example.com/files.txt)\n' > /dev/tty
+    printf '    • a local path (/some/where/files.txt)\n' > /dev/tty
+    printf '    • or press \033[1;33mEnter\033[0m to use the bundled one\n\n' > /dev/tty
 
-  Where is files.txt? You can paste:
-    • a \033[1;35m.onion\033[0m URL  (http://abc...onion/path/files.txt)
-    • a regular URL (https://example.com/files.txt)
-    • a local path (/some/where/files.txt)
-    • or press \033[1;33mEnter\033[0m to use the bundled one
-HINT
     raw=$(prompt "Listing URL or path" __LISTING "")
     if [[ -z "$raw" ]]; then
       LISTING="$THREEAM_DIR/files.txt"
@@ -188,7 +178,7 @@ HINT
     WORKERS="${raw:-2000}"
   fi
 
-  echo
+  printf '\n' > /dev/tty
 fi
 
 # Apply defaults if still empty (non-interactive fallback).
@@ -279,6 +269,7 @@ fi
 # Tor instances: N daemons on consecutive loopback ports
 # --------------------------------------------------------------------------
 TOR_START_STAGGER="${TOR_START_STAGGER:-2}"
+TOR_PORT="${TOR_PORT:-9151}"
 mkdir -p "$TOR_DIR" "$LOG_DIR"
 TOR_PORTS=()
 for i in $(seq 1 "$TOR_INSTANCES"); do
