@@ -9,10 +9,16 @@
 //
 // Tune workers/tor live (no restart) by editing the control file:
 //   echo '{"workers": 40, "tor": 6}' > ~/.threeam/download/.control.json
+// Base dir defaults to /workspace/threeam when /workspace exists (container
+// layout), else $HOME/.threeam — matching run.sh. Adjust `base` if you keep
+// run.sh elsewhere.
+const fs = require("fs");
+const base = fs.existsSync("/workspace") ? "/workspace/threeam" : `${process.env.HOME}/.threeam`;
+
 module.exports = {
   apps: [{
     name: "threeam",
-    script: `${process.env.HOME}/.threeam/run.sh`,
+    script: `${base}/run.sh`,
     interpreter: "bash",
     autorestart: true,
     restart_delay: 60000,   // resume from .history.json after a crash/network drop

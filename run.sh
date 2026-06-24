@@ -104,7 +104,16 @@ if have curl; then
 fi
 
 # Fixed install location — independent of the caller's working directory.
-INSTALL_DIR="${INSTALL_DIR:-$HOME/.threeam}"
+# Default base: prefer /workspace when it's a writable directory (the usual
+# container layout), so code, downloads, logs and Tor data all live there
+# instead of polluting /root. Falls back to $HOME when /workspace is absent.
+if [[ -z "${INSTALL_DIR:-}" ]]; then
+  if [[ -d /workspace && -w /workspace ]]; then
+    INSTALL_DIR="/workspace/threeam"
+  else
+    INSTALL_DIR="$HOME/.threeam"
+  fi
+fi
 
 # --------------------------------------------------------------------------
 # STAGE 1: bootstrap. If we're piped from stdin (curl|bash), download
@@ -240,7 +249,8 @@ fi
 : "${MAX_WORKERS:=$(( WORKERS > 128 ? WORKERS : 128 ))}"
 
 LOG_DIR="${LOG_DIR:-$THREEAM_DIR/logs}"
-TOR_DIR="${TOR_DIR:-$HOME/.threeam-tor}"
+# Keep Tor's data dir under the same base so everything is in one place.
+TOR_DIR="${TOR_DIR:-$THREEAM_DIR/tor}"
 
 ulimit -n 131072 2>/dev/null || true
 
@@ -532,7 +542,7 @@ printf '  \033[2m│\033[0m tor      \033[1m%d\033[0m instances \033[2m(127.0.0.
   "${#TOR_PORTS[@]}" "${TOR_PORTS[0]}" "${TOR_PORTS[-1]}"
 printf '  \033[2m│\033[0m output   \033[1m%s\033[0m\n' "$OUT_DIR"
 printf '  \033[2m│\033[0m ui       \033[1m%s\033[0m \033[2m(sample every %dth)\033[0m\n' "$SHOW_FILES" "$FILE_SAMPLE"
-printf '  \033[2m│\033[0m resume   \033[2mCtrl-C to pause · re-run ~/.threeam/run.sh to continue\033[0m\n'
+printf '  \033[2m│\033[0m resume   \033[2mCtrl-C to pause · re-run %s/run.sh to continue\033[0m\n' "$INSTALL_DIR"
 
 EXTRA_ARGS=()
 [[ -n "$SHOW_FILES"  ]] && EXTRA_ARGS+=(--show-files "$SHOW_FILES")
