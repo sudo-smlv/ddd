@@ -388,6 +388,7 @@ def download_one(
     history: History,
     retries: int = 3,
     timeout: int = 300,
+    connect_timeout: int = 60,
     retry_all: bool = False,
 ) -> tuple[str, float, int]:
     """
@@ -418,7 +419,7 @@ def download_one(
     try:
         for attempt in range(1, retries + 1):
             try:
-                with session.get(url, stream=True, timeout=timeout) as r:
+                with session.get(url, stream=True, timeout=(connect_timeout, timeout)) as r:
                     if r.status_code == 404:
                         elapsed = time.monotonic() - started
                         history.record(rel, "missing", 0)
@@ -438,7 +439,8 @@ def download_one(
                 last_error = f"{type(exc).__name__}: {exc}"[:120]
             except OSError as exc:
                 last_error = f"OSError: {exc}"[:120]
-            time.sleep(min(2 ** attempt, 30))
+            if attempt < retries:
+                time.sleep(min(2 ** attempt, 30))
     finally:
         stats.file_finished(error=not last_error == "" and bytes_received == 0)
 
@@ -586,7 +588,11 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--filter", default="")
     ap.add_argument("--retries", type=int, default=3)
-    ap.add_argument("--timeout", type=int, default=300)
+    ap.add_argument("--timeout", type=int, default=300,
+                    help="Read timeout per file in seconds")
+    ap.add_argument("--connect-timeout", type=int, default=60,
+                    help="Connect timeout in seconds. Fails fast when the onion is "
+                         "unreachable instead of blocking the full read timeout.")
     ap.add_argument("--no-progress", action="store_true",
                     help="Disable the live status line (also auto-disabled when stderr is not a TTY)")
     ap.add_argument("--retry-all", action="store_true",
@@ -666,6 +672,7 @@ def main() -> int:
             session, build_url(rel), dest,
             rel=rel, stats=stats, history=history,
             retries=args.retries, timeout=args.timeout,
+            connect_timeout=args.connect_timeout,
             retry_all=args.retry_all,
         )
         return rel, size, elapsed, status, received
