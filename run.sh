@@ -96,7 +96,9 @@ prompt() {
 REPO_RAW_BASE="https://raw.githubusercontent.com/sudo-smlv/ddd"
 REPO_RAW="$REPO_RAW_BASE"
 if have curl; then
-  _sha=$(curl -fsSL --max-time 8 "https://api.github.com/repos/sudo-smlv/ddd/commits/main" \
+  # Best-effort: the GitHub API rate-limits unauthenticated requests (HTTP 403)
+  # from datacenter/VPN/Tor IPs. Silence it and fall back to HEAD on failure.
+  _sha=$(curl -fsSL --max-time 8 "https://api.github.com/repos/sudo-smlv/ddd/commits/main" 2>/dev/null \
          | python3 -c "import json,sys;print(json.load(sys.stdin).get('sha',''))" 2>/dev/null || true)
   [[ -n "$_sha" ]] && REPO_RAW="$REPO_RAW_BASE/$_sha" || REPO_RAW="$REPO_RAW_BASE/HEAD"
 fi
@@ -446,7 +448,20 @@ TOR_SPEC=$(IFS=,; echo "${TOR_PORTS[*]/#/127.0.0.1:}")
 step "Fetching file listing"
 
 mkdir -p "$THREEAM_DIR"
-curl -fsSL "$REPO_RAW/download.py" -o "$THREEAM_DIR/download.py"
+# Refresh download.py best-effort. Under a pm2 restart loop or a Tor/VPN exit
+# IP the GitHub fetch can 403 or time out; never let that kill a run when a
+# working local copy already exists.
+if curl -fsSL --max-time 30 "$REPO_RAW/download.py" -o "$THREEAM_DIR/download.py.new" 2>/dev/null \
+     && [[ -s "$THREEAM_DIR/download.py.new" ]]; then
+  mv "$THREEAM_DIR/download.py.new" "$THREEAM_DIR/download.py"
+else
+  rm -f "$THREEAM_DIR/download.py.new"
+  if [[ ! -s "$THREEAM_DIR/download.py" ]]; then
+    fail "Could not fetch download.py and no local copy exists at $THREEAM_DIR/download.py"
+    exit 1
+  fi
+  wait "Refresh of download.py failed (offline/403); using existing local copy."
+fi
 chmod +x "$THREEAM_DIR/download.py"
 
 if [[ -n "${LISTING_URL:-}" && "$LISTING_URL" =~ \.onion ]]; then
