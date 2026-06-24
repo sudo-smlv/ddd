@@ -46,6 +46,7 @@ import argparse
 import collections
 import itertools
 import json
+import random
 import re
 import sys
 import threading
@@ -395,6 +396,7 @@ def download_one(
     timeout: int = 300,
     connect_timeout: int = 60,
     retry_all: bool = False,
+    rate_limit_retries: int = 8,
 ) -> tuple[str, float, int]:
     """
     Download ``url`` to ``dest``. Returns ``(status, elapsed_seconds, bytes)``.
@@ -421,14 +423,34 @@ def download_one(
     started = time.monotonic()
     last_error = ""
     bytes_received = 0
+    net_attempt = 0      # network/transport errors (small budget: `retries`)
+    rl_attempt = 0       # 429/503 rate-limit hits (larger budget: `rate_limit_retries`)
     try:
-        for attempt in range(1, retries + 1):
+        while True:
+            backoff = 0.0
             try:
+                bytes_received = 0  # reset per attempt; previous .part is rewritten
                 with session.get(url, stream=True, timeout=(connect_timeout, timeout)) as r:
                     if r.status_code == 404:
                         elapsed = time.monotonic() - started
                         history.record(rel, "missing", 0)
                         return "missing", elapsed, 0
+                    if r.status_code in (429, 503):
+                        # Server is overloaded / rate-limiting. This is transient,
+                        # not a real failure — back off (honouring Retry-After)
+                        # and keep trying on a generous budget.
+                        rl_attempt += 1
+                        last_error = f"HTTP {r.status_code} (rate-limited x{rl_attempt})"
+                        if rl_attempt > rate_limit_retries:
+                            break
+                        ra = r.headers.get("Retry-After", "").strip()
+                        if ra.isdigit():
+                            backoff = min(float(ra), 60.0)
+                        else:
+                            backoff = min(3.0 * (2 ** min(rl_attempt - 1, 4)), 60.0)
+                        backoff += random.uniform(0, max(1.0, backoff * 0.3))
+                        time.sleep(backoff)
+                        continue
                     r.raise_for_status()
                     with open(part, "wb") as f:
                         for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
@@ -444,8 +466,10 @@ def download_one(
                 last_error = f"{type(exc).__name__}: {exc}"[:120]
             except OSError as exc:
                 last_error = f"OSError: {exc}"[:120]
-            if attempt < retries:
-                time.sleep(min(2 ** attempt, 30))
+            net_attempt += 1
+            if net_attempt >= retries:
+                break
+            time.sleep(min(2 ** net_attempt, 30))
     finally:
         stats.file_finished(error=not last_error == "" and bytes_received == 0)
 
@@ -593,6 +617,9 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--filter", default="")
     ap.add_argument("--retries", type=int, default=3)
+    ap.add_argument("--rate-limit-retries", type=int, default=8,
+                    help="How many times to retry a 429/503 (server overloaded) "
+                         "with exponential backoff before giving up. Default: 8")
     ap.add_argument("--timeout", type=int, default=300,
                     help="Read timeout per file in seconds")
     ap.add_argument("--connect-timeout", type=int, default=60,
@@ -679,6 +706,7 @@ def main() -> int:
             retries=args.retries, timeout=args.timeout,
             connect_timeout=args.connect_timeout,
             retry_all=args.retry_all,
+            rate_limit_retries=args.rate_limit_retries,
         )
         return rel, size, elapsed, status, received
 
