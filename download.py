@@ -328,8 +328,13 @@ class Stats:
                f"  (now {fmt_speed(samples[-1])})"
 
     def record_checkpoint_speed(self) -> None:
+        # NB: rolling_speed / lifetime_speed each acquire self.lock themselves,
+        # so compute them *before* taking the lock here. threading.Lock is not
+        # reentrant — doing this inside `with self.lock` self-deadlocks the
+        # reporter thread on the very first checkpoint and freezes all output.
+        speed = self.rolling_speed or self.lifetime_speed
         with self.lock:
-            self.speed_history.append(self.rolling_speed or self.lifetime_speed)
+            self.speed_history.append(speed)
 
 
 # ---------------------------------------------------------------------------
