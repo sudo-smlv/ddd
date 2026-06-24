@@ -28,9 +28,28 @@ set -euo pipefail
 # --------------------------------------------------------------------------
 # Helpers (defined early so the bootstrap section can use them)
 # --------------------------------------------------------------------------
-log() { printf '\033[1;34m[setup]\033[0m %s\n' "$*"; }
-err() { printf '\033[1;31m[err ]\033[0m %s\n' "$*" >&2; }
+# ---- output helpers --------------------------------------------------------
+log()  { printf '  \033[2m[setup]\033[0m %s\n' "$*"; }
+err()  { printf '  \033[1;31m[err ]\033[0m %s\n' "$*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Section header: ▶ step name ...
+step() { printf '\n\033[1;36m▶\033[0m \033[1m%s\033[0m\n' "$*"; }
+
+# Status: ✓ green, … grey, ✗ red
+ok()   { printf '  \033[1;32m✓\033[0m %s\n' "$*"; }
+wait() { printf '  \033[2m…\033[0m %s\n' "$*"; }
+fail() { printf '  \033[1;31m✗\033[0m %s\n' "$*" >&2; }
+
+# Mini progress bar: bar 60%  with leading "  ⠿ "
+bar() {
+  local pct=$1 width=30
+  local filled=$((width * pct / 100))
+  printf '\033[2m  ⠿ [\033[0m\033[1;36m%s\033[0m\033[2m%s]\033[0m \033[1m%3d%%\033[0m' \
+    "$(printf '█%.0s' $(seq 1 $filled 2>/dev/null) 2>/dev/null)" \
+    "$(printf '░%.0s' $(seq 1 $((width - filled)) 2>/dev/null) 2>/dev/null)" \
+    "$pct"
+}
 
 # Pretty prompt that works whether stdin is piped or a TTY.
 # Args: PROMPT_TEXT DEFAULT_VAR_NAME [DEFAULT_VALUE]
@@ -235,9 +254,13 @@ port_listening() {
   (exec 3<>/dev/tcp/127.0.0.1/"$1") >/dev/null 2>&1 && { exec 3<&- 3>&-; return 0; } || return 1
 }
 
-# Python
+# ==========================================================================
+# STEP 1 — environment + Python deps
+# ==========================================================================
+step "Checking environment"
+
 if ! have python3; then
-  log "Installing python3..."
+  wait "Installing python3..."
   if [[ "$PKG_FAMILY" == "brew" ]]; then
     pkg_install_one python@3.12; eval "$(brew shellenv)"
   else
@@ -251,25 +274,36 @@ if ! have python3; then
   fi
 fi
 PY="$(command -v python3)"
-log "Using python: $($PY --version) ($PY)"
+ok "Python \033[1m$($PY --version | awk '{print $2}')\033[0m at \033[2m$PY\033[0m"
+
 if ! $PY -m pip --version >/dev/null 2>&1; then
   $PY -m ensurepip --user >/dev/null 2>&1 || true
   $PY -m pip --version >/dev/null 2>&1 || { err "pip not available"; exit 1; }
 fi
-log "Installing Python deps (requests, pysocks)..."
-$PY -m pip install --user --quiet --upgrade pip
-$PY -m pip install --user --quiet requests pysocks
 
-# Tor
-if ! have tor; then
-  log "Installing Tor..."
-  pkg_update; pkg_install_one tor
+if $PY -c "import requests, socks" 2>/dev/null; then
+  ok "Python packages \033[2m(requests, pysocks)\033[0m already installed"
+else
+  wait "Installing Python deps \033[2m(requests, pysocks)\033[0m..."
+  $PY -m pip install --user --quiet --no-warn-script-location --disable-pip-version-check \
+    requests pysocks >/dev/null 2>&1 || \
+  $PY -m pip install --user --quiet --no-warn-script-location \
+    requests pysocks 2>&1 | grep -vE '^WARNING|^ERROR|root' | sed 's/^/    /' || true
+  ok "Python packages installed"
 fi
 
-# --------------------------------------------------------------------------
-# Tor instances: N daemons on consecutive loopback ports
-# --------------------------------------------------------------------------
-TOR_START_STAGGER="${TOR_START_STAGGER:-2}"
+# Tor binary
+if ! have tor; then
+  wait "Installing Tor..."
+  pkg_update; pkg_install_one tor 2>&1 | tail -3 | sed 's/^/    /' || true
+fi
+ok "Tor \033[2m$(tor --version 2>/dev/null | head -1 | awk '{print $3}')\033[0m"
+
+# ==========================================================================
+# STEP 2 — Tor instances (launched IN PARALLEL, no stagger)
+# ==========================================================================
+step "Launching $TOR_INSTANCES Tor instances in parallel"
+
 TOR_PORT="${TOR_PORT:-9151}"
 mkdir -p "$TOR_DIR" "$LOG_DIR"
 TOR_PORTS=()
@@ -277,6 +311,7 @@ for i in $(seq 1 "$TOR_INSTANCES"); do
   TOR_PORTS+=($((TOR_PORT + i - 1)))
 done
 
+# Write all torrcs up front
 for idx in "${!TOR_PORTS[@]}"; do
   i=$((idx + 1)); port="${TOR_PORTS[$idx]}"
   inst_dir="$TOR_DIR/instance-$i"
@@ -290,93 +325,135 @@ MaxClientCircuitsPending 128
 EOF
 done
 
+# Launch ALL Tor daemons in parallel (no sleep between)
+started_at=$(date +%s)
+launched=0
+already=0
 for idx in "${!TOR_PORTS[@]}"; do
   i=$((idx + 1)); port="${TOR_PORTS[$idx]}"
-  inst_dir="$TOR_DIR/instance-$i"; log_file="$inst_dir/tor.log"; pid_file="$inst_dir/tor.pid"
-  if port_listening "$port"; then log "Tor #$i already on :$port"; continue; fi
-  if pgrep -f "tor -f ${inst_dir}/torrc" >/dev/null 2>&1; then
-    log "Tor #$i already running, waiting for :$port..."
-    for _ in {1..120}; do port_listening "$port" && break; sleep 1; done
+  inst_dir="$TOR_DIR/instance-$i"
+  log_file="$inst_dir/tor.log"; pid_file="$inst_dir/tor.pid"
+  if port_listening "$port"; then
+    already=$((already + 1))
     continue
   fi
-  log "Starting Tor #$i on 127.0.0.1:$port ..."
+  if pgrep -f "tor -f ${inst_dir}/torrc" >/dev/null 2>&1; then
+    continue
+  fi
   nohup tor -f "$inst_dir/torrc" >"$log_file" 2>&1 &
   echo $! > "$pid_file"
-  sleep "$TOR_START_STAGGER"
+  launched=$((launched + 1))
 done
+[[ $already -gt 0 ]] && ok "$already instance(s) already listening"
+[[ $launched -gt 0 ]] && wait "$launched Tor processes spawned, waiting for ports..."
 
+# Animated spinner while waiting for ports
+spinner='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+spin_idx=0
 WAIT_TIMEOUT=180
-for idx in "${!TOR_PORTS[@]}"; do
-  port="${TOR_PORTS[$idx]}"; i=$((idx + 1))
-  log "Waiting for Tor #$i (port $port)..."
-  last_pct=0
-  for s in $(seq 1 $WAIT_TIMEOUT); do
-    if port_listening "$port"; then log "Tor #$i up on :$port (after ${s}s)"; break; fi
-    if [[ $((s % 10)) -eq 0 ]]; then
-      ready=0
-      for p in "${TOR_PORTS[@]}"; do port_listening "$p" && ready=$((ready+1)); done
-      log "  ... ${s}s elapsed, $ready/${#TOR_PORTS[@]} instances ready"
-    fi
-    sleep 1
-    if [[ $s -eq $WAIT_TIMEOUT ]]; then
-      err "Tor #$i (port $port) not ready in ${WAIT_TIMEOUT}s"; tail -n 15 "$TOR_DIR/instance-$i/tor.log" >&2 || true
-      TOR_PORTS=("${TOR_PORTS[@]:0:$idx}" "${TOR_PORTS[@]:$((idx+1))}")
-      idx=$((idx - 1))
-    fi
-  done
+deadline=$((started_at + WAIT_TIMEOUT))
+total=${#TOR_PORTS[@]}
+while :; do
+  ready=0
+  for p in "${TOR_PORTS[@]}"; do port_listening "$p" && ready=$((ready + 1)); done
+  pct=$((ready * 100 / total))
+  elapsed=$(( $(date +%s) - started_at ))
+  # \r overwrites the same line; no newline until done
+  printf '\r\033[2m  ⠿ [\033[0m\033[1;36m%-*s\033[0m\033[2m] %3d%%  %d/%d  %ds\033[0m  ' \
+    30 "$(printf '█%.0s' $(seq 1 $((30 * pct / 100)) 2>/dev/null) 2>/dev/null)$(printf '░%.0s' $(seq 1 $((30 - 30 * pct / 100)) 2>/dev/null) 2>/dev/null)" \
+    "$pct" "$ready" "$total" "$elapsed"
+  if [[ $ready -eq $total ]]; then break; fi
+  if [[ $(date +%s) -ge $deadline ]]; then break; fi
+  printf '%s' "${spinner:$((spin_idx % ${#spinner})):1}"
+  spin_idx=$((spin_idx + 1))
+  sleep 0.3
 done
+printf '\n'
+elapsed=$(( $(date +%s) - started_at ))
 
-if [[ ${#TOR_PORTS[@]} -eq 0 ]]; then err "No Tor instances ready"; exit 1; fi
-log "${#TOR_PORTS[@]}/$TOR_INSTANCES Tor instances up on ports ${TOR_PORTS[*]}"
+# Drop any instances that didn't come up
+final_ports=()
+final_idx=0
+for idx in "${!TOR_PORTS[@]}"; do
+  port="${TOR_PORTS[$idx]}"
+  if port_listening "$port"; then
+    final_ports+=("$port")
+  else
+    i=$((idx + 1))
+    tail -n 5 "$TOR_DIR/instance-$i/tor.log" | sed "s/^/    [tor-$i] /" >&2 || true
+  fi
+  final_idx=$((final_idx + 1))
+done
+TOR_PORTS=("${final_ports[@]}")
+
+if [[ ${#TOR_PORTS[@]} -eq 0 ]]; then
+  fail "No Tor instances became ready in ${WAIT_TIMEOUT}s"
+  exit 1
+fi
+ok "\033[1m${#TOR_PORTS[@]}\033[0m/\033[2m$TOR_INSTANCES\033[0m Tor instances listening on 127.0.0.1:\033[2m${TOR_PORTS[0]}\033[0m-\033[2m${TOR_PORTS[-1]}\033[0m  \033[2m(${elapsed}s)\033[0m"
 
 TOR_SPEC=$(IFS=,; echo "${TOR_PORTS[*]/#/127.0.0.1:}")
 
-# --------------------------------------------------------------------------
-# Fetch the listing from LISTING_URL (if user pasted one) — through Tor if
-# it's an .onion URL, direct otherwise.
-# --------------------------------------------------------------------------
-if [[ -n "${LISTING_URL:-}" && "$LISTING_URL" =~ \.onion ]]; then
-  log "Fetching listing from $LISTING_URL (via Tor)..."
-  if ! curl --socks5-hostname 127.0.0.1:"${TOR_PORTS[0]}" -fsSL "$LISTING_URL" -o "$LISTING"; then
-    err "Failed to fetch $LISTING_URL through Tor"
-    exit 1
-  fi
-elif [[ -n "${LISTING_URL:-}" ]]; then
-  log "Fetching listing from $LISTING_URL ..."
-  if ! curl -fsSL "$LISTING_URL" -o "$LISTING"; then
-    err "Failed to fetch $LISTING_URL"; exit 1
-  fi
-fi
+# ==========================================================================
+# STEP 3 — fetch the listing (through Tor if .onion)
+# ==========================================================================
+step "Fetching file listing"
 
-# Refresh download.py + ensure files.txt present
 mkdir -p "$THREEAM_DIR"
 curl -fsSL "$REPO_RAW/download.py" -o "$THREEAM_DIR/download.py"
 chmod +x "$THREEAM_DIR/download.py"
-if [[ ! -f "$LISTING" && -f "$THREEAM_DIR/files.txt" ]]; then
-  LISTING="$THREEAM_DIR/files.txt"
-fi
-if [[ ! -f "$LISTING" ]]; then
-  log "files.txt not present, fetching..."
-  curl -fsSL "$REPO_RAW/files.txt" -o "$LISTING"
+
+if [[ -n "${LISTING_URL:-}" && "$LISTING_URL" =~ \.onion ]]; then
+  if curl --socks5-hostname 127.0.0.1:"${TOR_PORTS[0]}" -fsSL "$LISTING_URL" -o "$LISTING" 2>/dev/null; then
+    ok "Fetched listing from \033[1;35m$LISTING_URL\033[0m via Tor"
+  else
+    fail "Could not fetch $LISTING_URL through Tor"
+    exit 1
+  fi
+elif [[ -n "${LISTING_URL:-}" ]]; then
+  if curl -fsSL "$LISTING_URL" -o "$LISTING"; then
+    ok "Fetched listing from \033[1m$LISTING_URL\033[0m"
+  else
+    fail "Could not fetch $LISTING_URL"
+    exit 1
+  fi
+elif [[ ! -f "$LISTING" ]]; then
+  if [[ -f "$THREEAM_DIR/files.txt" ]]; then
+    LISTING="$THREEAM_DIR/files.txt"
+  else
+    wait "Downloading bundled files.txt..."
+    curl -fsSL "$REPO_RAW/files.txt" -o "$LISTING"
+  fi
 fi
 
-if [[ -z "$LISTING" || ! -f "$LISTING" ]]; then
-  err "Listing not found. Pass --files PATH or --url URL."
+if [[ -f "$LISTING" ]]; then
+  size=$(stat -c%s "$LISTING" 2>/dev/null || stat -f%z "$LISTING" 2>/dev/null || echo 0)
+  ok "Listing ready: \033[1m$LISTING\033[0m \033[2m($((size / 1024 / 1024)) MiB)\033[0m"
+else
+  fail "Listing not found. Pass --files PATH or --url URL."
   exit 1
 fi
 
+# ==========================================================================
+# STEP 4 — hand off to the downloader
+# ==========================================================================
+step "Launching downloader"
+
 mkdir -p "$OUT_DIR"
-log "Starting full download -> $OUT_DIR"
-log "  listing    : $LISTING"
-log "  workers    : $WORKERS"
-log "  tor insts  : ${#TOR_PORTS[@]} (ports ${TOR_PORTS[*]})"
-log "  show-files : $SHOW_FILES (sampling every ${FILE_SAMPLE}th)"
-log "(Ctrl-C to pause; re-run ~/.threeam/run.sh to resume)"
-echo
+
+# Compact config line
+printf '  \033[2m│\033[0m workers  \033[1m%s\033[0m\n' "$WORKERS"
+printf '  \033[2m│\033[0m tor      \033[1m%d\033[0m instances \033[2m(127.0.0.1:%s-%s)\033[0m\n' \
+  "${#TOR_PORTS[@]}" "${TOR_PORTS[0]}" "${TOR_PORTS[-1]}"
+printf '  \033[2m│\033[0m output   \033[1m%s\033[0m\n' "$OUT_DIR"
+printf '  \033[2m│\033[0m ui       \033[1m%s\033[0m \033[2m(sample every %dth)\033[0m\n' "$SHOW_FILES" "$FILE_SAMPLE"
+printf '  \033[2m│\033[0m resume   \033[2mCtrl-C to pause · re-run ~/.threeam/run.sh to continue\033[0m\n'
 
 EXTRA_ARGS=()
 [[ -n "$SHOW_FILES"  ]] && EXTRA_ARGS+=(--show-files "$SHOW_FILES")
 [[ -n "$FILE_SAMPLE" ]] && EXTRA_ARGS+=(--file-sample "$FILE_SAMPLE")
+
+echo
 
 $PY "$THREEAM_DIR/download.py" \
   --list  "$LISTING" \
@@ -386,5 +463,5 @@ $PY "$THREEAM_DIR/download.py" \
   "${EXTRA_ARGS[@]}" \
   2>&1 | tee -a "$LOG_DIR/download.log"
 
-log "Done. Stop all Tor instances with: pkill -f 'tor -f $TOR_DIR'"
-log "Re-run anytime: $INSTALL_DIR/run.sh"
+ok "Done. Stop all Tor instances: \033[1mpkill -f 'tor -f $TOR_DIR'\033[0m"
+ok "Re-run anytime:           \033[1m$INSTALL_DIR/run.sh\033[0m"
