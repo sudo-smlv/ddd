@@ -542,20 +542,32 @@ class Reporter(threading.Thread):
         self._stop.set()
 
     def run(self) -> None:
-        # First checkpoint at 3s (so user sees progress quickly even if
-        # workers are slow), then every milestone_interval after that.
         next_milestone = 3.0
-        while not self._stop.wait(self.interval):
-            elapsed = time.monotonic() - self.stats.start
-            if elapsed >= next_milestone:
-                self.stats.record_checkpoint_speed()
-                sys.stdout.write("\n" + self.stats.render_milestone() + "\n")
-                sys.stdout.flush()
-                next_milestone = elapsed + self.milestone_interval
-            if self._stderr_tty:
-                line = self.stats.render_status_line()
-                sys.stderr.write("\r" + line + "\033[K")
-                sys.stderr.flush()
+        try:
+            while not self._stop.wait(self.interval):
+                elapsed = time.monotonic() - self.stats.start
+                if elapsed >= next_milestone:
+                    try:
+                        self.stats.record_checkpoint_speed()
+                        msg = self.stats.render_milestone()
+                        sys.stdout.write("\n" + msg + "\n")
+                        sys.stdout.flush()
+                        next_milestone = elapsed + self.milestone_interval
+                    except Exception as e:
+                        sys.stderr.write(f"[reporter] checkpoint error: {e}\n")
+                        sys.stderr.flush()
+                        next_milestone = elapsed + self.milestone_interval
+                if self._stderr_tty:
+                    try:
+                        line = self.stats.render_status_line()
+                        sys.stderr.write("\r" + line + "\033[K")
+                        sys.stderr.flush()
+                    except Exception as e:
+                        sys.stderr.write(f"[reporter] status error: {e}\n")
+                        sys.stderr.flush()
+        except Exception as e:
+            sys.stderr.write(f"[reporter] fatal: {e}\n")
+            sys.stderr.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -636,7 +648,7 @@ def main() -> int:
           f"  history     : {grey(str(history_path))}  (new)", flush=True)
     print(flush=True)
     print(f"{cyan('▶')} Starting {args.workers} workers across {len(proxies)} Tor instance(s)...", flush=True)
-    print(f"{grey('  checkpoints every 10s. Per-file lines for errors, files >= 1 MiB, and every {args.file_sample}th completion.')}",
+    print(f"{grey(f'  checkpoints every 10s. Per-file lines for errors, files >= 1 MiB, and every {args.file_sample}th completion.')}",
           flush=True)
     print(f"{grey('  Press Ctrl-C to pause; re-run to resume.')}", flush=True)
     print(flush=True)
