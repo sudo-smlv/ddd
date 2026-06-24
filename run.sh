@@ -345,20 +345,35 @@ for idx in "${!TOR_PORTS[@]}"; do
   launched=$((launched + 1))
 done
 [[ $already -gt 0 ]] && ok "$already instance(s) already listening"
-[[ $launched -gt 0 ]] && wait "$launched Tor processes spawned, waiting for ports..."
+[[ $launched -gt 0 ]] && wait "$launched Tor processes spawned, waiting for ports + bootstrap..."
 
-# Animated spinner while waiting for ports
+# Wait until each Tor has BOOTSTRAPPED 100% (not just port open).
+# SocksPort can be listening long before consensus is loaded and
+# circuits are usable — connecting too early hangs the downloader.
 spinner='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 spin_idx=0
 WAIT_TIMEOUT=180
 deadline=$((started_at + WAIT_TIMEOUT))
 total=${#TOR_PORTS[@]}
+
+# Build a status array: per port, "ready" when its log contains
+# "Bootstrapped 100%" (or "Fully bootstrapped" on older Tor).
+declare -A PORT_STATE
 while :; do
   ready=0
-  for p in "${TOR_PORTS[@]}"; do port_listening "$p" && ready=$((ready + 1)); done
+  for idx in "${!TOR_PORTS[@]}"; do
+    port="${TOR_PORTS[$idx]}"
+    i=$((idx + 1))
+    log_file="$TOR_DIR/instance-$i/tor.log"
+    if port_listening "$port" \
+       && grep -qE 'Bootstrapped 100%|Fully bootstrapped' "$log_file" 2>/dev/null; then
+      PORT_STATE[$port]="ready"; ready=$((ready + 1))
+    else
+      PORT_STATE[$port]="waiting"
+    fi
+  done
   pct=$((ready * 100 / total))
   elapsed=$(( $(date +%s) - started_at ))
-  # \r overwrites the same line; no newline until done
   printf '\r\033[2m  ⠿ [\033[0m\033[1;36m%-*s\033[0m\033[2m] %3d%%  %d/%d  %ds\033[0m  ' \
     30 "$(printf '█%.0s' $(seq 1 $((30 * pct / 100)) 2>/dev/null) 2>/dev/null)$(printf '░%.0s' $(seq 1 $((30 - 30 * pct / 100)) 2>/dev/null) 2>/dev/null)" \
     "$pct" "$ready" "$total" "$elapsed"
@@ -366,31 +381,32 @@ while :; do
   if [[ $(date +%s) -ge $deadline ]]; then break; fi
   printf '%s' "${spinner:$((spin_idx % ${#spinner})):1}"
   spin_idx=$((spin_idx + 1))
-  sleep 0.3
+  sleep 0.5
 done
 printf '\n'
 elapsed=$(( $(date +%s) - started_at ))
 
-# Drop any instances that didn't come up
+# Drop any instances that didn't fully bootstrap; show why
 final_ports=()
-final_idx=0
 for idx in "${!TOR_PORTS[@]}"; do
   port="${TOR_PORTS[$idx]}"
-  if port_listening "$port"; then
+  i=$((idx + 1))
+  if [[ "${PORT_STATE[$port]:-waiting}" == "ready" ]]; then
     final_ports+=("$port")
   else
-    i=$((idx + 1))
-    tail -n 5 "$TOR_DIR/instance-$i/tor.log" | sed "s/^/    [tor-$i] /" >&2 || true
+    log_file="$TOR_DIR/instance-$i/tor.log"
+    printf '  \033[1;33m⚠\033[0m Tor #%d (port %s) did not bootstrap in %ds. Last lines:\n' \
+      "$i" "$port" "$WAIT_TIMEOUT" >&2
+    tail -n 5 "$log_file" 2>/dev/null | sed 's/^/      /' >&2 || true
   fi
-  final_idx=$((final_idx + 1))
 done
 TOR_PORTS=("${final_ports[@]}")
 
 if [[ ${#TOR_PORTS[@]} -eq 0 ]]; then
-  fail "No Tor instances became ready in ${WAIT_TIMEOUT}s"
+  fail "No Tor instances fully bootstrapped in ${WAIT_TIMEOUT}s"
   exit 1
 fi
-ok "\033[1m${#TOR_PORTS[@]}\033[0m/\033[2m$TOR_INSTANCES\033[0m Tor instances listening on 127.0.0.1:\033[2m${TOR_PORTS[0]}\033[0m-\033[2m${TOR_PORTS[-1]}\033[0m  \033[2m(${elapsed}s)\033[0m"
+ok "\033[1m${#TOR_PORTS[@]}\033[0m/\033[2m$TOR_INSTANCES\033[0m Tor instances bootstrapped on 127.0.0.1:\033[2m${TOR_PORTS[0]}\033[0m-\033[2m${TOR_PORTS[-1]}\033[0m  \033[2m(${elapsed}s)\033[0m"
 
 TOR_SPEC=$(IFS=,; echo "${TOR_PORTS[*]/#/127.0.0.1:}")
 
@@ -404,14 +420,14 @@ curl -fsSL "$REPO_RAW/download.py" -o "$THREEAM_DIR/download.py"
 chmod +x "$THREEAM_DIR/download.py"
 
 if [[ -n "${LISTING_URL:-}" && "$LISTING_URL" =~ \.onion ]]; then
-  if curl --socks5-hostname 127.0.0.1:"${TOR_PORTS[0]}" -fsSL "$LISTING_URL" -o "$LISTING" 2>/dev/null; then
+  if curl --max-time 180 --socks5-hostname 127.0.0.1:"${TOR_PORTS[0]}" -fsSL "$LISTING_URL" -o "$LISTING"; then
     ok "Fetched listing from \033[1;35m$LISTING_URL\033[0m via Tor"
   else
     fail "Could not fetch $LISTING_URL through Tor"
     exit 1
   fi
 elif [[ -n "${LISTING_URL:-}" ]]; then
-  if curl -fsSL "$LISTING_URL" -o "$LISTING"; then
+  if curl --max-time 180 -fsSL "$LISTING_URL" -o "$LISTING"; then
     ok "Fetched listing from \033[1m$LISTING_URL\033[0m"
   else
     fail "Could not fetch $LISTING_URL"
