@@ -29,17 +29,30 @@ set -euo pipefail
 # Helpers (defined early so the bootstrap section can use them)
 # --------------------------------------------------------------------------
 # ---- output helpers --------------------------------------------------------
-log()  { printf '  \033[2m[setup]\033[0m %s\n' "$*"; }
-err()  { printf '  \033[1;31m[err ]\033[0m %s\n' "$*" >&2; }
+log()  { printf '  \033[2m[setup]\033[0m %b\n' "$*"; }
+err()  { printf '  \033[1;31m[err ]\033[0m %b\n' "$*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # Section header: ▶ step name ...
-step() { printf '\n\033[1;36m▶\033[0m \033[1m%s\033[0m\n' "$*"; }
+step() { printf '\n\033[1;36m▶\033[0m \033[1m%b\033[0m\n' "$*"; }
 
 # Status: ✓ green, … grey, ✗ red
-ok()   { printf '  \033[1;32m✓\033[0m %s\n' "$*"; }
-wait() { printf '  \033[2m…\033[0m %s\n' "$*"; }
-fail() { printf '  \033[1;31m✗\033[0m %s\n' "$*" >&2; }
+ok()   { printf '  \033[1;32m✓\033[0m %b\n' "$*"; }
+wait() { printf '  \033[2m…\033[0m %b\n' "$*"; }
+fail() { printf '  \033[1;31m✗\033[0m %b\n' "$*" >&2; }
+
+# Validate a positive integer; re-prompt if invalid
+prompt_int() {
+  local text="$1" var="$2" default="${3:-}" answer
+  while :; do
+    answer=$(prompt "$text" __P "$default")
+    if [[ "$answer" =~ ^[0-9]+$ ]] && [[ "$answer" -gt 0 ]]; then
+      eval "$var=\"\$answer\""
+      return 0
+    fi
+    printf '  \033[1;33m⚠\033[0m \033[2m"%s" is not a positive number, try again.\033[0m\n' "$answer" > /dev/tty 2>/dev/null || true
+  done
+}
 
 # Mini progress bar: bar 60%  with leading "  ⠿ "
 bar() {
@@ -189,13 +202,11 @@ if $INTERACTIVE; then
   fi
 
   if [[ -z "${TOR_INSTANCES:-}" ]]; then
-    raw=$(prompt "Tor instances (one per ~50 workers; loopback only)" __TI "20")
-    TOR_INSTANCES="${raw:-20}"
+    prompt_int "Tor instances (one per ~50 workers; loopback only)" TOR_INSTANCES "20"
   fi
 
   if [[ -z "${WORKERS:-}" ]]; then
-    raw=$(prompt "Concurrent downloads" __WK "2000")
-    WORKERS="${raw:-2000}"
+    prompt_int "Concurrent downloads" WORKERS "5000"
   fi
 
   printf '\n' > /dev/tty
