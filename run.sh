@@ -217,6 +217,10 @@ fi
 : "${WORKERS:=2000}"
 : "${SHOW_FILES:=sampled}"
 : "${FILE_SAMPLE:=50}"
+# Upper bound for *live* worker tuning (see .control.json). You can raise the
+# live worker count up to this without restarting. Defaults to a bit above the
+# starting value so there's headroom.
+: "${MAX_WORKERS:=$(( WORKERS > 128 ? WORKERS : 128 ))}"
 
 LOG_DIR="${LOG_DIR:-$THREEAM_DIR/logs}"
 TOR_DIR="${TOR_DIR:-$HOME/.threeam-tor}"
@@ -515,6 +519,7 @@ $PY "$THREEAM_DIR/download.py" \
   --out   "$OUT_DIR" \
   --tor   "$TOR_SPEC" \
   --workers "$WORKERS" \
+  --max-workers "$MAX_WORKERS" \
   "${EXTRA_ARGS[@]}" \
   --log "$LOG_DIR/download.log"
 

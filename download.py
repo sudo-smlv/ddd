@@ -218,6 +218,7 @@ class Stats:
         self.start = time.monotonic()
         # rel -> [received_bytes, total_size, started_monotonic]
         self.active_map: dict[str, list] = {}
+        self.controls = None  # set to a Controls instance for the live row
 
     def add_bytes(self, n: int, rel: str | None = None) -> None:
         now = time.monotonic()
@@ -356,6 +357,11 @@ class Stats:
             row("History",    sparkline),
             row("Elapsed",    f"{fmt_duration(elapsed)}   ETA {fmt_duration(eta)}   finish {fmt_clock(eta)}"),
         ]
+        if self.controls is not None:
+            wlim, tcount, tavail = self.controls.snapshot()
+            lines.append(row("Live", f"{bold(str(wlim))} workers   "
+                                     f"{bold(str(tcount))}/{tavail} tor   "
+                                     f"{grey('edit ' + '.control.json')}"))
         active_rows = self._active_rows()
         if active_rows:
             lines.append(sep)
@@ -509,15 +515,172 @@ _tls = threading.local()
 _session_counter = itertools.count()
 
 
-def _get_session(proxies: list[str | None]) -> requests.Session:
+def _get_session(controls: "Controls") -> requests.Session:
+    """Per-thread session, rebuilt when the live Tor set changes (generation)."""
+    gen, proxies = controls.proxy_snapshot()
     sess = getattr(_tls, "session", None)
-    if sess is not None:
+    if sess is not None and getattr(_tls, "gen", None) == gen:
         return sess
+    if sess is not None:
+        try:
+            sess.close()
+        except Exception:
+            pass
     idx = next(_session_counter)
     proxy = proxies[idx % len(proxies)] if proxies else None
     sess = make_session(proxy)
     _tls.session = sess
+    _tls.gen = gen
     return sess
+
+
+# ---------------------------------------------------------------------------
+# Live, runtime-tunable controls (workers + tor) via a JSON control file
+# ---------------------------------------------------------------------------
+
+class DynamicGate:
+    """A semaphore whose permit count can be changed at runtime.
+
+    Lowering the limit lets in-flight work drain naturally (active threads
+    finish, new ones wait); raising it wakes waiters immediately.
+    """
+
+    def __init__(self, limit: int):
+        self._limit = max(1, limit)
+        self._active = 0
+        self._cond = threading.Condition()
+
+    def set_limit(self, n: int) -> None:
+        with self._cond:
+            self._limit = max(1, int(n))
+            self._cond.notify_all()
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def active(self) -> int:
+        return self._active
+
+    def acquire(self) -> None:
+        with self._cond:
+            while self._active >= self._limit:
+                self._cond.wait(timeout=1.0)
+            self._active += 1
+
+    def release(self) -> None:
+        with self._cond:
+            self._active = max(0, self._active - 1)
+            self._cond.notify()
+
+
+class Controls:
+    """Shared, thread-safe live configuration.
+
+    ``available`` is the full list of Tor proxies that run.sh actually started;
+    the control file's ``tor`` count selects how many of them to spread over.
+    """
+
+    def __init__(self, gate: DynamicGate, available: list[str | None],
+                 max_workers: int = 0):
+        self.lock = threading.Lock()
+        self.gate = gate
+        self.available = list(available)
+        self.tor_count = len(available)
+        self.proxies = list(available)
+        self.gen = 0
+        self.max_workers = max_workers or gate.limit
+
+    def proxy_snapshot(self) -> tuple[int, list]:
+        with self.lock:
+            return self.gen, self.proxies
+
+    def snapshot(self) -> tuple[int, int, int]:
+        """(workers_limit, tor_count, tor_available) for display."""
+        with self.lock:
+            return self.gate.limit, self.tor_count, len(self.available)
+
+    def apply(self, workers: int | None, tor: int | None) -> list[str]:
+        """Apply new values; returns human-readable change notes."""
+        notes: list[str] = []
+        if workers is not None and workers >= 1:
+            workers = min(workers, self.max_workers)
+            if workers != self.gate.limit:
+                old = self.gate.limit
+                self.gate.set_limit(workers)
+                notes.append(f"workers {old} → {workers}")
+        if tor is not None:
+            with self.lock:
+                n = max(1, min(int(tor), len(self.available)))
+                if n != self.tor_count:
+                    old = self.tor_count
+                    self.tor_count = n
+                    self.proxies = self.available[:n]
+                    self.gen += 1
+                    notes.append(f"tor {old} → {n}")
+        return notes
+
+
+class Controller(threading.Thread):
+    """Polls the JSON control file and applies changes live.
+
+    Control file (default ``<out>/.control.json``)::
+
+        {"workers": 20, "tor": 3}
+    """
+
+    def __init__(self, path: Path, controls: Controls, console: "Console",
+                 interval: float = 3.0):
+        super().__init__(daemon=True, name="controller")
+        self.path = path
+        self.controls = controls
+        self.console = console
+        self.interval = interval
+        self._stop_event = threading.Event()
+        self._mtime = 0.0
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def write_initial(self) -> None:
+        w, tor, _ = self.controls.snapshot()
+        try:
+            if not self.path.exists():
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self.path.write_text(json.dumps({"workers": w, "tor": tor}, indent=2),
+                                     encoding="utf-8")
+            self._mtime = self.path.stat().st_mtime
+        except OSError:
+            pass
+
+    def _read_and_apply(self) -> None:
+        try:
+            st = self.path.stat()
+        except OSError:
+            return
+        if st.st_mtime == self._mtime:
+            return
+        self._mtime = st.st_mtime
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        workers = data.get("workers")
+        tor = data.get("tor")
+        notes = self.controls.apply(
+            int(workers) if isinstance(workers, (int, float, str)) and str(workers).isdigit() else None,
+            int(tor) if isinstance(tor, (int, float, str)) and str(tor).isdigit() else None,
+        )
+        if notes:
+            self.console.log(cyan("⚙ control update: ") + ", ".join(notes))
+
+    def run(self) -> None:
+        while not self._stop_event.wait(self.interval):
+            try:
+                self._read_and_apply()
+            except Exception as e:
+                sys.stderr.write(f"[controller] error: {e}\n")
 
 
 def download_one(
@@ -772,6 +935,13 @@ def main() -> int:
     ap.add_argument("--log", default="", type=str,
                     help="Append a plain-text (un-coloured) copy of all output to this file. "
                          "Lets the live panel own the terminal instead of being piped through tee.")
+    ap.add_argument("--max-workers", type=int, default=0,
+                    help="Upper bound for live worker tuning (thread pool size). "
+                         "Default: max(workers, 64). You can raise the live 'workers' value "
+                         "up to this cap via the control file without restarting.")
+    ap.add_argument("--control", default="", type=str,
+                    help="Path to the JSON control file for live tuning of workers/tor. "
+                         "Default: <out>/.control.json")
     args = ap.parse_args()
 
     if not args.list.exists():
@@ -842,27 +1012,46 @@ def main() -> int:
         f"{cyan('▶')} Starting {args.workers} workers across {len(proxies)} Tor instance(s)...   "
         f"{grey('Ctrl-C to pause; re-run to resume.')}")
 
+    # Live-tunable controls: gate concurrency with a dynamic semaphore and let
+    # a control file change workers/tor at runtime.
+    pool_size = args.max_workers if args.max_workers > 0 else max(args.workers, 64)
+    pool_size = max(pool_size, args.workers)
+    gate = DynamicGate(max(1, args.workers))
+    controls = Controls(gate, proxies, max_workers=pool_size)
+    stats.controls = controls
+    control_path = Path(args.control) if args.control else (args.out / ".control.json")
+    controller = Controller(control_path, controls, console)
+    controller.write_initial()
+    console.print_banner(
+        f"  {grey('live control:')} {grey(str(control_path))}  "
+        f"{grey(f'(workers 1..{pool_size}, tor 1..{len(proxies)}; edits apply within ~3s)')}")
+
     reporter = Reporter(stats, console)
     if not args.no_progress:
         reporter.start()
+    controller.start()
 
     counts: dict[str, int] = {"ok": 0, "skip": 0, "missing": 0, "error": 0}
 
     def task(rel: str, size: int) -> tuple[str, int, float, str, int]:
-        session = _get_session(proxies)
-        dest = args.out / rel.replace("\\", "/")
-        status, elapsed, received = download_one(
-            session, build_url(rel), dest,
-            rel=rel, size=size, stats=stats, history=history,
-            retries=args.retries, timeout=args.timeout,
-            connect_timeout=args.connect_timeout,
-            retry_all=args.retry_all,
-            rate_limit_retries=args.rate_limit_retries,
-        )
+        gate.acquire()
+        try:
+            session = _get_session(controls)
+            dest = args.out / rel.replace("\\", "/")
+            status, elapsed, received = download_one(
+                session, build_url(rel), dest,
+                rel=rel, size=size, stats=stats, history=history,
+                retries=args.retries, timeout=args.timeout,
+                connect_timeout=args.connect_timeout,
+                retry_all=args.retry_all,
+                rate_limit_retries=args.rate_limit_retries,
+            )
+        finally:
+            gate.release()
         return rel, size, elapsed, status, received
 
     try:
-        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
+        with ThreadPoolExecutor(max_workers=pool_size) as ex:
             futures = [ex.submit(task, rel, size) for rel, size in files]
             for i, fut in enumerate(as_completed(futures), 1):
                 rel, size, elapsed, status, received = fut.result()
@@ -914,6 +1103,7 @@ def main() -> int:
                         f"  {icon} [{i:>6}/{total_files}]  {tag}  "
                         f"{size:>12,}  {timing}   {rel_display}")
     finally:
+        controller.stop()
         reporter.stop()
         if reporter.is_alive():
             reporter.join(timeout=2)
