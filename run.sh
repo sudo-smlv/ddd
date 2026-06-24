@@ -33,6 +33,12 @@ log()  { printf '  \033[2m[setup]\033[0m %b\n' "$*"; }
 err()  { printf '  \033[1;31m[err ]\033[0m %b\n' "$*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Robust controlling-terminal detection. `[[ -r /dev/tty ]]` can succeed while
+# actually opening /dev/tty fails with ENXIO ("No such device or address") when
+# there is no controlling terminal (pm2/systemd/cron/docker without -t). Try a
+# real open so non-interactive callers fall back to env/defaults cleanly.
+if { : >/dev/tty; } 2>/dev/null; then HAVE_TTY=1; else HAVE_TTY=0; fi
+
 # Section header: ▶ step name ...
 step() { printf '\n\033[1;36m▶\033[0m \033[1m%b\033[0m\n' "$*"; }
 
@@ -69,7 +75,7 @@ bar() {
 prompt() {
   local text="$1" var="$2" default="${3:-}"
   local answer
-  if [[ -r /dev/tty ]]; then
+  if [[ "$HAVE_TTY" == 1 ]]; then
     printf '\n  \033[1;36m▸\033[0m \033[1m%s\033[0m' "$text" > /dev/tty
     if [[ -n "$default" ]]; then
       printf '  \033[2m(default: %s)\033[0m' "$default" > /dev/tty
@@ -110,6 +116,7 @@ if [[ -z "$_self" || "$_self" == "/dev/stdin" || ! -f "$_self" ]]; then
   mkdir -p "$INSTALL_DIR"
   curl -fsSL "$REPO_RAW/run.sh"      -o "$INSTALL_DIR/run.sh"
   curl -fsSL "$REPO_RAW/download.py" -o "$INSTALL_DIR/download.py"
+  curl -fsSL "$REPO_RAW/ecosystem.config.js" -o "$INSTALL_DIR/ecosystem.config.js" 2>/dev/null || true
   if ! curl -fsSL "$REPO_RAW/files.txt" -o "$INSTALL_DIR/files.txt"; then
     err "Failed to fetch files.txt from $REPO_RAW/files.txt"
     err "Re-run when the network is up, or copy your own to $INSTALL_DIR/files.txt"
@@ -171,8 +178,16 @@ done
 # supply values via flags/env. Non-interactive callers always get defaults.
 # --------------------------------------------------------------------------
 INTERACTIVE=false
-if [[ -r /dev/tty ]] && [[ -z "${LISTING:-}${LISTING_URL:-}" || -z "${TOR_INSTANCES:-}" || -z "${WORKERS:-}" ]]; then
+if [[ "$HAVE_TTY" == 1 ]] && [[ -z "${LISTING:-}${LISTING_URL:-}" || -z "${TOR_INSTANCES:-}" || -z "${WORKERS:-}" ]]; then
   INTERACTIVE=true
+fi
+
+# Non-interactive without a listing? Fail clearly instead of silently using the
+# bundled files.txt (which is almost never what a pm2/cron caller wants).
+if ! $INTERACTIVE && [[ -z "${LISTING:-}${LISTING_URL:-}" ]]; then
+  err "No listing given and no TTY to prompt."
+  err "Set LISTING_URL (…?sub=files.txt) — e.g. in your pm2 ecosystem env block."
+  exit 1
 fi
 
 if $INTERACTIVE; then
