@@ -474,26 +474,40 @@ else
 fi
 chmod +x "$THREEAM_DIR/download.py"
 
+listing_size() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || echo 0; }
+
 if [[ -n "${LISTING_URL:-}" && "$LISTING_URL" =~ \.onion ]]; then
+  fetched=0
   attempt=0
   while [[ $attempt -lt 5 ]]; do
     attempt=$((attempt + 1))
     wait "Fetching listing from .onion via Tor (attempt $attempt/5)..."
-    rm -f "$LISTING"
+    # Fetch to a temp file so a failure never destroys an existing cached
+    # listing (the .onion is often down — we fall back to the cache below).
     if curl --max-time 600 --speed-time 30 --speed-limit 1024 \
          --socks5-hostname 127.0.0.1:"${TOR_PORTS[$((attempt % ${#TOR_PORTS[@]}))]}" \
-         -fsSL "$LISTING_URL" -o "$LISTING"; then
+         -fsSL "$LISTING_URL" -o "$LISTING.new" 2>/dev/null \
+       && [[ "$(listing_size "$LISTING.new")" -gt 1024 ]]; then
+      mv "$LISTING.new" "$LISTING"
       ok "Fetched listing from \033[1;35m$LISTING_URL\033[0m via Tor"
+      fetched=1
       break
     fi
-    if [[ $attempt -eq 5 ]]; then
-      fail "Could not fetch $LISTING_URL through Tor after 5 attempts"
+    rm -f "$LISTING.new"
+    wait "  Onion unreachable (SOCKS host-unreachable), retrying next Tor instance in 5s..."
+    [[ $attempt -lt 5 ]] && sleep 5
+  done
+  if [[ $fetched -eq 0 ]]; then
+    # The .onion is down. If we already have a cached listing, use it instead
+    # of aborting — you can still retry the missing files when the site is up.
+    if [[ "$(listing_size "$LISTING")" -gt 1024 ]]; then
+      ok "Onion unreachable — using cached listing \033[1m$LISTING\033[0m \033[2m($(( $(listing_size "$LISTING") / 1024 / 1024 )) MiB)\033[0m"
+    else
+      fail "Could not fetch the listing and no cached copy exists."
+      err "The .onion looks down (SOCKS5 host-unreachable). Wait and retry, or pass --files /path/to/files.txt"
       exit 1
     fi
-    got=$(stat -c%s "$LISTING" 2>/dev/null || stat -f%z "$LISTING" 2>/dev/null || echo 0)
-    wait "  Got ${got} bytes, retrying with next Tor instance in 5s..."
-    sleep 5
-  done
+  fi
 elif [[ -n "${LISTING_URL:-}" ]]; then
   if curl --max-time 600 -fsSL "$LISTING_URL" -o "$LISTING"; then
     ok "Fetched listing from \033[1m$LISTING_URL\033[0m"
